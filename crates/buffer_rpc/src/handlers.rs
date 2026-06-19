@@ -305,8 +305,16 @@ async fn buffer_open(id: Id, params: Option<serde_json::Value>, cx: &mut AsyncAp
 /// Absolute paths go through `Project::open_local_buffer`, which creates the
 /// invisible worktree itself for paths outside all existing worktrees (and
 /// reuses an existing worktree otherwise) — we do not re-implement
-/// `find_or_create_worktree` (constraint 7).  A relative path is joined against
-/// the first visible worktree root, then opened the same way.
+/// `find_or_create_worktree` (constraint 7).
+///
+/// NON-absolute paths (relative, or root-name-prefixed "project" paths) are
+/// resolved with `Project::find_project_path`, which scans every visible
+/// worktree for a matching entry — so a path under the second root resolves to
+/// the second root, not blindly to the first.  We never join to the first
+/// worktree root and never reimplement resolution.  An unresolved path returns
+/// `None`, which the caller maps to JSON-RPC `INVALID_PARAMS`: we do not create
+/// a new file via an unprefixed relative path (abs-path + `open_local_buffer`
+/// already covers new-file-outside-worktree).
 fn prepare_open(
     project: &Entity<Project>,
     path: &Path,
@@ -316,14 +324,8 @@ fn prepare_open(
         return Some(project.update(cx, |project, cx| project.open_local_buffer(path, cx)));
     }
 
-    let root = project
-        .read(cx)
-        .visible_worktrees(cx)
-        .next()?
-        .read(cx)
-        .abs_path();
-    let abs_path = root.join(path);
-    Some(project.update(cx, |project, cx| project.open_local_buffer(&abs_path, cx)))
+    let project_path = project.read(cx).find_project_path(path, cx)?;
+    Some(project.update(cx, |project, cx| project.open_buffer(project_path, cx)))
 }
 
 // ── buffer/text ─────────────────────────────────────────────────────────────
@@ -587,10 +589,97 @@ fn parse_params<T: serde::de::DeserializeOwned>(
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use gpui::AppContext;
+    use fs::FakeFs;
+    use gpui::{AppContext, TestAppContext};
     use language::{BufferEditSource, BufferEvent};
+    use serde_json::json;
+    use settings::SettingsStore;
+    use util::path;
 
     use super::*;
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+    }
+
+    /// Regression for T-04952 (daedalus #9009): in a multi-root workspace, a
+    /// non-absolute path that exists under the SECOND visible worktree must
+    /// resolve to the second root — NOT be blindly joined against the first
+    /// root. The previous `prepare_open` joined every relative path to
+    /// `first_root/<path>`, opening/creating the wrong file.
+    #[gpui::test]
+    async fn prepare_open_resolves_path_under_second_root(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root1"), json!({ "only1.txt": "one" }))
+            .await;
+        fs.insert_tree(path!("/root2"), json!({ "only2.txt": "two" }))
+            .await;
+        let project = Project::test(
+            fs.clone(),
+            [path!("/root1").as_ref(), path!("/root2").as_ref()],
+            cx,
+        )
+        .await;
+
+        let second_root_id = project.read_with(cx, |project, cx| {
+            project
+                .visible_worktrees(cx)
+                .nth(1)
+                .expect("two visible worktrees")
+                .read(cx)
+                .id()
+        });
+
+        // A file that exists ONLY under the second root. The buggy code would
+        // have joined it to /root1/only2.txt; the fix scans every worktree.
+        let task = cx
+            .update(|cx| prepare_open(&project, Path::new("only2.txt"), cx))
+            .expect("relative path resolves to a worktree entry");
+        let buffer = task.await.expect("buffer opens");
+
+        let worktree_id = buffer.read_with(cx, |buffer, cx| {
+            buffer
+                .file()
+                .expect("opened buffer has a file")
+                .worktree_id(cx)
+        });
+        assert_eq!(
+            worktree_id, second_root_id,
+            "path under the second root must resolve to the second root, not the first"
+        );
+    }
+
+    /// A non-absolute path that matches no worktree entry must NOT silently fall
+    /// back to the first root / create a new file — `prepare_open` returns
+    /// `None`, which the caller maps to JSON-RPC INVALID_PARAMS.
+    #[gpui::test]
+    async fn prepare_open_rejects_unresolved_relative_path(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root1"), json!({ "only1.txt": "one" }))
+            .await;
+        fs.insert_tree(path!("/root2"), json!({ "only2.txt": "two" }))
+            .await;
+        let project = Project::test(
+            fs.clone(),
+            [path!("/root1").as_ref(), path!("/root2").as_ref()],
+            cx,
+        )
+        .await;
+
+        let resolved =
+            cx.update(|cx| prepare_open(&project, Path::new("does-not-exist.txt"), cx).is_some());
+        assert!(
+            !resolved,
+            "an unresolved relative path must return None (→ INVALID_PARAMS), not pick the first root"
+        );
+    }
 
     #[gpui::test]
     fn agent_edit_uses_agent_source_and_one_undo_step(cx: &mut App) {

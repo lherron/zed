@@ -2506,6 +2506,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clock",
+ "fs",
  "futures 0.3.32",
  "gpui",
  "language",
@@ -2513,8 +2514,10 @@ dependencies = [
  "release_channel",
  "serde",
  "serde_json",
+ "settings",
  "text",
  "thiserror 2.0.17",
+ "util",
  "workspace",
  "worktree",
 ]
