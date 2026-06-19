@@ -41,7 +41,12 @@ pub struct BufferRpcServer {
     /// keeping it alive, so the server must retain it here to keep it reachable
     /// by `buffer/text` (and later `buffer/edit`/`buffer/save`).  Keyed by the
     /// protocol buffer id (`BufferId::to_proto`).
-    opened_buffers: HashMap<u64, Entity<Buffer>>,
+    opened_buffers: HashMap<u64, OpenedBuffer>,
+}
+
+struct OpenedBuffer {
+    buffer: Entity<Buffer>,
+    project: Entity<project::Project>,
 }
 
 impl Global for BufferRpcServer {}
@@ -52,13 +57,28 @@ impl BufferRpcServer {
     }
 
     /// Retain a strong handle to an RPC-opened buffer so it stays alive.
-    pub fn retain_buffer(&mut self, buffer_id: u64, buffer: Entity<Buffer>) {
-        self.opened_buffers.insert(buffer_id, buffer);
+    pub fn retain_buffer(
+        &mut self,
+        buffer_id: u64,
+        buffer: Entity<Buffer>,
+        project: Entity<project::Project>,
+    ) {
+        self.opened_buffers
+            .insert(buffer_id, OpenedBuffer { buffer, project });
     }
 
     /// Look up a previously RPC-opened buffer by its protocol id.
     pub fn buffer(&self, buffer_id: u64) -> Option<Entity<Buffer>> {
-        self.opened_buffers.get(&buffer_id).cloned()
+        self.opened_buffers
+            .get(&buffer_id)
+            .map(|opened| opened.buffer.clone())
+    }
+
+    /// Look up the project that opened a previously RPC-opened buffer.
+    pub fn buffer_project(&self, buffer_id: u64) -> Option<Entity<project::Project>> {
+        self.opened_buffers
+            .get(&buffer_id)
+            .map(|opened| opened.project.clone())
     }
 }
 

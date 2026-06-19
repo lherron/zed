@@ -270,8 +270,8 @@ pub fn decode_version(wire: WireVersion) -> Global {
 ///   received operations the caller has never seen.
 ///
 /// This is spec §2 constraint 3 — no silent rebase.
-pub fn version_is_stale(_base: &Global, _current: &Global) -> bool {
-    unimplemented!("M2 — version_is_stale: awaiting impl in handlers (constraint 3 gate)")
+pub fn version_is_stale(base: &Global, current: &Global) -> bool {
+    current.changed_since(base)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

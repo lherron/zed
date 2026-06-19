@@ -10,21 +10,27 @@
 //! (constraint 6): `open_local_buffer` creates an invisible worktree and does
 //! not register the buffer with any LSP.  M1 intentionally does not wire LSP.
 
-use std::path::{Path, PathBuf};
+use std::{
+    ops::Range as StdRange,
+    path::{Path, PathBuf},
+};
 
 use gpui::{App, AsyncApp, Entity, Task};
-use language::Buffer;
+use language::{AutoindentMode, Buffer, BufferEditSource};
 use project::Project;
 use release_channel::{AppVersion, ReleaseChannel};
 use workspace::MultiWorkspace;
 
 use crate::BufferRpcServer;
-use crate::positions::{Position, Range, encode_version, point_utf16_to_offset};
+use crate::positions::{
+    Position, Range, decode_version, encode_version, point_utf16_to_offset, version_is_stale,
+};
 use crate::protocol::{
-    BufferInfo, BufferOpenParams, BufferOpenResult, BufferTextParams, BufferTextResult,
-    CURRENT_ACTIVE, InitializeParams, InitializeResult, PROTOCOL_VERSION, PingResult, Request,
-    Response, STALE_WORKSPACE, WorkspaceActiveResult, WorkspaceInfo, WorkspaceTargetParams,
-    same_protocol_major,
+    BufferEdit, BufferEditParams, BufferEditResult, BufferInfo, BufferOpenParams, BufferOpenResult,
+    BufferSaveParams, BufferSaveResult, BufferTextParams, BufferTextResult, CONFLICT,
+    CURRENT_ACTIVE, ConflictErrorData, InitializeParams, InitializeResult, PROTOCOL_VERSION,
+    PingResult, Request, Response, STALE_WORKSPACE, SavedMtime, WorkspaceActiveResult,
+    WorkspaceInfo, WorkspaceTargetParams, same_protocol_major,
 };
 
 const INVALID_REQUEST: i64 = -32600;
@@ -56,6 +62,8 @@ pub async fn dispatch(request: Request, cx: &mut AsyncApp) -> Option<Response> {
         "buffer/list" => cx.update(|cx| buffer_list(id, request.params, cx)),
         "buffer/open" => buffer_open(id, request.params, cx).await,
         "buffer/text" => cx.update(|cx| buffer_text(id, request.params, cx)),
+        "buffer/edit" => cx.update(|cx| buffer_edit(id, request.params, cx)),
+        "buffer/save" => buffer_save(id, request.params, cx).await,
         _ => Response::error(id, METHOD_NOT_FOUND, "method not found"),
     };
     Some(response)
@@ -242,10 +250,11 @@ async fn buffer_open(id: Id, params: Option<serde_json::Value>, cx: &mut AsyncAp
     // Resolve the workspace and build the (async) open task on the foreground.
     let prepared = cx.update(|cx| {
         let project = resolve_project(&params.workspace, cx)?;
-        prepare_open(&project, &path, cx)
+        let task = prepare_open(&project, &path, cx)?;
+        Some((project, task))
     });
 
-    let Some(task) = prepared else {
+    let Some((project, task)) = prepared else {
         // Either a stale workspace or an unresolvable relative path.  Re-resolve
         // once to distinguish for a precise error.
         let resolvable = cx.update(|cx| resolve_project(&params.workspace, cx).is_some());
@@ -274,8 +283,11 @@ async fn buffer_open(id: Id, params: Option<serde_json::Value>, cx: &mut AsyncAp
         // RPC-opened invisible buffer has no editor keeping it alive, so without
         // this it would be dropped before the next buffer/text call.
         if cx.has_global::<BufferRpcServer>() {
-            cx.global_mut::<BufferRpcServer>()
-                .retain_buffer(info.buffer_id, buffer.clone());
+            cx.global_mut::<BufferRpcServer>().retain_buffer(
+                info.buffer_id,
+                buffer.clone(),
+                project,
+            );
         }
         Response::result(
             id,
@@ -341,6 +353,144 @@ fn buffer_text(id: Id, params: Option<serde_json::Value>, cx: &mut App) -> Respo
     Response::result(id, BufferTextResult { text, version })
 }
 
+// ── buffer/edit ─────────────────────────────────────────────────────────────
+
+fn buffer_edit(id: Id, params: Option<serde_json::Value>, cx: &mut App) -> Response {
+    let params = match parse_params::<BufferEditParams>(params) {
+        Ok(params) => params,
+        Err(make_error) => return make_error(id),
+    };
+
+    if let Err(message) = validate_edit_source(params.source.as_deref()) {
+        return Response::error(id, INVALID_PARAMS, message);
+    }
+
+    let Some(buffer) = find_buffer(params.buffer_id, cx) else {
+        return Response::error(id, INVALID_PARAMS, "unknown bufferId");
+    };
+
+    let current_version = buffer.read(cx).version();
+    if let Some(base_version) = params.base_version {
+        let base_version = decode_version(base_version);
+        if version_is_stale(&base_version, &current_version) {
+            return conflict(id, &current_version);
+        }
+    }
+
+    let text = buffer.read(cx).text_snapshot().text();
+    let edits = match decode_edits(&text, params.edits) {
+        Ok(edits) => edits,
+        Err(message) => return Response::error(id, INVALID_PARAMS, message),
+    };
+    let autoindent = params
+        .autoindent
+        .unwrap_or(false)
+        .then_some(AutoindentMode::EachLine);
+
+    let (version, lamport) = apply_agent_edit(&buffer, edits, autoindent, cx);
+
+    Response::result(id, BufferEditResult { version, lamport })
+}
+
+fn apply_agent_edit(
+    buffer: &Entity<Buffer>,
+    edits: Vec<(StdRange<usize>, String)>,
+    autoindent: Option<AutoindentMode>,
+    cx: &mut App,
+) -> (crate::positions::WireVersion, Option<u32>) {
+    buffer.update(cx, |buffer, cx| {
+        buffer.finalize_last_transaction();
+        buffer.start_transaction();
+        let lamport = buffer
+            .edit(edits, autoindent, cx)
+            .map(|timestamp| timestamp.value);
+        buffer.end_transaction_with_source(BufferEditSource::Agent, cx);
+        (encode_version(&buffer.version()), lamport)
+    })
+}
+
+fn validate_edit_source(source: Option<&str>) -> Result<(), String> {
+    match source {
+        None | Some("Agent") | Some("agent") => Ok(()),
+        Some(source) => Err(format!(
+            "unsupported edit source '{source}'; M2 supports only Agent"
+        )),
+    }
+}
+
+fn conflict(id: Id, current_version: &clock::Global) -> Response {
+    Response::error_with_data(
+        id,
+        CONFLICT,
+        "buffer version conflict",
+        ConflictErrorData {
+            kind: "Conflict",
+            current_version: encode_version(current_version),
+        },
+    )
+}
+
+fn decode_edits(
+    text: &str,
+    edits: Vec<BufferEdit>,
+) -> Result<Vec<(StdRange<usize>, String)>, String> {
+    edits
+        .into_iter()
+        .map(|edit| {
+            let start = offset_of(text, &edit.range.start)?;
+            let end = offset_of(text, &edit.range.end)?;
+            if start > end {
+                return Err(format!("range start ({start}) is after end ({end})"));
+            }
+            if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+                return Err("range endpoint does not fall on a UTF-8 char boundary".to_string());
+            }
+            Ok((start..end, edit.new_text))
+        })
+        .collect()
+}
+
+// ── buffer/save ─────────────────────────────────────────────────────────────
+
+async fn buffer_save(id: Id, params: Option<serde_json::Value>, cx: &mut AsyncApp) -> Response {
+    let params = match parse_params::<BufferSaveParams>(params) {
+        Ok(params) => params,
+        Err(make_error) => return make_error(id),
+    };
+
+    let prepared = cx.update(|cx| {
+        let buffer = find_buffer(params.buffer_id, cx)?;
+        let project = find_project_for_buffer(params.buffer_id, cx)?;
+        let task = project.update(cx, |project, cx| project.save_buffer(buffer.clone(), cx));
+        Some((buffer, task))
+    });
+
+    let Some((buffer, task)) = prepared else {
+        return Response::error(id, INVALID_PARAMS, "unknown bufferId");
+    };
+
+    if let Err(error) = task.await {
+        return Response::error(id, INTERNAL_ERROR, format!("buffer save failed: {error:#}"));
+    }
+
+    cx.update(|cx| {
+        let buffer = buffer.read(cx);
+        Response::result(
+            id,
+            BufferSaveResult {
+                version: encode_version(&buffer.version()),
+                saved_mtime: buffer
+                    .saved_mtime()
+                    .and_then(|mtime| mtime.to_seconds_and_nanos_for_persistence())
+                    .map(|(secs_since_epoch, nanos_since_epoch)| SavedMtime {
+                        secs_since_epoch,
+                        nanos_since_epoch,
+                    }),
+            },
+        )
+    })
+}
+
 /// Find an opened buffer by its protocol id.
 ///
 /// Checks the server's retained RPC-opened buffers first (invisible buffers not
@@ -359,6 +509,25 @@ fn find_buffer(buffer_id: u64, cx: &mut App) -> Option<Entity<Buffer>> {
             .find(|buffer| buffer.read(cx).remote_id().to_proto() == buffer_id)
         {
             return Some(buffer);
+        }
+    }
+    None
+}
+
+fn find_project_for_buffer(buffer_id: u64, cx: &mut App) -> Option<Entity<Project>> {
+    if cx.has_global::<BufferRpcServer>()
+        && let Some(project) = cx.global::<BufferRpcServer>().buffer_project(buffer_id)
+    {
+        return Some(project);
+    }
+
+    for entry in enumerate_workspaces(cx) {
+        let buffers = entry.project.read(cx).opened_buffers(cx);
+        if buffers
+            .iter()
+            .any(|buffer| buffer.read(cx).remote_id().to_proto() == buffer_id)
+        {
+            return Some(entry.project);
         }
     }
     None
@@ -412,4 +581,54 @@ fn parse_params<T: serde::de::DeserializeOwned>(
     serde_json::from_value::<T>(value).map_err(|error| {
         move |id: Id| Response::error(id, INVALID_PARAMS, format!("invalid params: {error}"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use gpui::AppContext;
+    use language::{BufferEditSource, BufferEvent};
+
+    use super::*;
+
+    #[gpui::test]
+    fn agent_edit_uses_agent_source_and_one_undo_step(cx: &mut App) {
+        let buffer = cx.new(|cx| Buffer::local("abcdef", cx));
+        let sources = Arc::new(Mutex::new(Vec::new()));
+        let _subscription = cx.subscribe(&buffer, {
+            let sources = sources.clone();
+            move |_, event, _| {
+                if let BufferEvent::Edited { source } = event {
+                    sources.lock().expect("sources lock poisoned").push(*source);
+                }
+            }
+        });
+
+        buffer.update(cx, |buffer, cx| {
+            buffer.start_transaction();
+            buffer.edit([(0..0, "user ")], None, cx);
+            buffer.end_transaction(cx);
+        });
+        sources.lock().expect("sources lock poisoned").clear();
+
+        let edits = vec![(5..8, "XYZ".to_string()), (11..11, "!".to_string())];
+        apply_agent_edit(&buffer, edits, None, cx);
+
+        assert_eq!(
+            &*sources.lock().expect("sources lock poisoned"),
+            &[BufferEditSource::Agent]
+        );
+        assert_eq!(buffer.read(cx).text_snapshot().text(), "user XYZdef!");
+
+        buffer.update(cx, |buffer, cx| {
+            buffer.undo(cx);
+        });
+        assert_eq!(buffer.read(cx).text_snapshot().text(), "user abcdef");
+
+        buffer.update(cx, |buffer, cx| {
+            buffer.undo(cx);
+        });
+        assert_eq!(buffer.read(cx).text_snapshot().text(), "abcdef");
+    }
 }

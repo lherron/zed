@@ -72,6 +72,25 @@ impl Response {
             error: Some(ResponseError {
                 code,
                 message: message.into(),
+                data: None,
+            }),
+        }
+    }
+
+    pub fn error_with_data(
+        id: Option<Value>,
+        code: i64,
+        message: impl Into<String>,
+        data: impl Serialize,
+    ) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION,
+            id,
+            result: None,
+            error: Some(ResponseError {
+                code,
+                message: message.into(),
+                data: serde_json::to_value(data).ok(),
             }),
         }
     }
@@ -81,6 +100,8 @@ impl Response {
 pub struct ResponseError {
     pub code: i64,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 pub fn same_protocol_major(client_version: Option<&str>) -> bool {
@@ -99,6 +120,9 @@ pub fn same_protocol_major(client_version: Option<&str>) -> bool {
 /// `data.kind == "StaleWorkspace"`) to know the handle must be re-resolved via
 /// `workspace/list` / `"current-active"`, rather than retrying blindly.
 pub const STALE_WORKSPACE: i64 = -32010;
+
+/// JSON-RPC error code for a stale `baseVersion` on `buffer/edit`.
+pub const CONFLICT: i64 = -32020;
 
 /// One entry returned by `workspace/list`.
 #[derive(Debug, Clone, Serialize)]
@@ -172,4 +196,65 @@ pub struct BufferTextParams {
 pub struct BufferTextResult {
     pub text: String,
     pub version: WireVersion,
+}
+
+/// One edit inside `buffer/edit`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BufferEdit {
+    pub range: Range,
+    pub new_text: String,
+}
+
+/// Params for `buffer/edit`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BufferEditParams {
+    pub buffer_id: u64,
+    pub edits: Vec<BufferEdit>,
+    #[serde(default)]
+    pub base_version: Option<WireVersion>,
+    #[serde(default)]
+    pub autoindent: Option<bool>,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// Result of `buffer/edit`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BufferEditResult {
+    pub version: WireVersion,
+    pub lamport: Option<u32>,
+}
+
+/// Params for `buffer/save`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BufferSaveParams {
+    pub buffer_id: u64,
+}
+
+/// Result of `buffer/save`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BufferSaveResult {
+    pub version: WireVersion,
+    pub saved_mtime: Option<SavedMtime>,
+}
+
+/// Filesystem mtime persisted as Unix seconds + nanoseconds.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SavedMtime {
+    pub secs_since_epoch: u64,
+    pub nanos_since_epoch: u32,
+}
+
+/// Typed JSON-RPC error data for `buffer/edit` base-version conflicts.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictErrorData {
+    pub kind: &'static str,
+    pub current_version: WireVersion,
 }
