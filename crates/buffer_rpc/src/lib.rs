@@ -28,6 +28,7 @@ use language::Buffer;
 
 pub mod framing;
 pub mod handlers;
+pub mod notify;
 pub mod positions;
 pub mod protocol;
 pub mod transport;
