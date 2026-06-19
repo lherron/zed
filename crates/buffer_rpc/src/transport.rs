@@ -155,8 +155,15 @@ fn prepare_socket_path(path: &Path) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("socket path has no parent: {}", path.display()))?;
+    let created = !parent.exists();
     fs::create_dir_all(parent)
         .with_context(|| format!("creating Buffer RPC socket dir {}", parent.display()))?;
+    // Tighten the run dir to 0700 when we created it (umask-independent). Only
+    // touch perms on a dir we made, to avoid clobbering an existing dir's mode.
+    if created {
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("setting Buffer RPC socket dir mode {}", parent.display()))?;
+    }
 
     match UnixStream::connect(path) {
         Ok(_) => Err(anyhow!(

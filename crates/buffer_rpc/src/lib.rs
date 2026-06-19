@@ -15,12 +15,15 @@
 //! - [`handlers`] — M0 `initialize` and `ping` dispatch.
 //! - [`positions`] — stub for future UTF-16/anchor codecs.
 //!
-//! # Off-by-default
-//! The server is disabled unless `ZED_BUFFER_RPC_SOCK` is set or the settings flag is on.
-//! `socket_path_from_env_or_settings` returns `None` in that case; the `app.run` call site
-//! in `main.rs` uses it as a gate.
+//! # Always-on with a fixed default socket
+//! The server is always enabled. `socket_path_from_env_or_settings` always
+//! returns a `PathBuf`: a non-empty `ZED_BUFFER_RPC_SOCK` overrides
+//! (dev/multi-instance), otherwise it falls back to the fixed default
+//! `$HOME/praesidium/var/run/zed-buffer-rpc.sock` (mirroring the HRC socket
+//! convention). The `app.run` call site in `main.rs` initializes the server
+//! unconditionally with the resolved path.
 
-use std::{collections::HashMap, env, path::PathBuf};
+use std::{collections::HashMap, env, ffi::OsString, path::PathBuf};
 
 use futures::StreamExt;
 use gpui::{App, Entity, Global, Subscription};
@@ -173,11 +176,79 @@ pub fn init(path: PathBuf, cx: &mut App) {
     .detach();
 }
 
-pub fn socket_path_from_env_or_settings(_cx: &App) -> Option<PathBuf> {
-    let path = env::var_os("ZED_BUFFER_RPC_SOCK")?;
-    if path.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(path))
+/// Resolve the Buffer RPC socket path. Always returns a path (never `None`):
+/// the server is always-on.
+///
+/// - A non-empty `ZED_BUFFER_RPC_SOCK` overrides (dev / multi-instance).
+/// - Otherwise the fixed default `$HOME/praesidium/var/run/zed-buffer-rpc.sock`,
+///   mirroring the HRC socket convention (`~/praesidium/var/run/hrc/hrc.sock`).
+pub fn socket_path_from_env_or_settings(_cx: &App) -> PathBuf {
+    resolve_socket_path(env::var_os("ZED_BUFFER_RPC_SOCK"), env::var_os("HOME"))
+}
+
+/// The default socket path under `$HOME` when no override is given.
+fn default_socket_path(home: Option<OsString>) -> PathBuf {
+    // `$HOME` is always set in practice; fall back to the current directory so
+    // we still yield a usable relative path rather than panicking.
+    let home = home
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join("praesidium")
+        .join("var")
+        .join("run")
+        .join("zed-buffer-rpc.sock")
+}
+
+/// Pure resolution logic, factored out so it can be unit-tested without an `App`.
+/// An empty `ZED_BUFFER_RPC_SOCK` is treated as absent (uses the default).
+fn resolve_socket_path(env_sock: Option<OsString>, home: Option<OsString>) -> PathBuf {
+    match env_sock {
+        Some(sock) if !sock.is_empty() => PathBuf::from(sock),
+        _ => default_socket_path(home),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_empty_env_overrides() {
+        let resolved = resolve_socket_path(
+            Some(OsString::from("/tmp/custom-zed-rpc.sock")),
+            Some(OsString::from("/home/someone")),
+        );
+        assert_eq!(resolved, PathBuf::from("/tmp/custom-zed-rpc.sock"));
+    }
+
+    #[test]
+    fn empty_env_uses_default() {
+        let resolved = resolve_socket_path(
+            Some(OsString::from("")),
+            Some(OsString::from("/home/someone")),
+        );
+        assert_eq!(
+            resolved,
+            PathBuf::from("/home/someone/praesidium/var/run/zed-buffer-rpc.sock")
+        );
+    }
+
+    #[test]
+    fn unset_env_uses_default() {
+        let resolved = resolve_socket_path(None, Some(OsString::from("/home/someone")));
+        assert_eq!(
+            resolved,
+            PathBuf::from("/home/someone/praesidium/var/run/zed-buffer-rpc.sock")
+        );
+    }
+
+    #[test]
+    fn missing_home_falls_back_to_relative_default() {
+        let resolved = resolve_socket_path(None, None);
+        assert_eq!(
+            resolved,
+            PathBuf::from("./praesidium/var/run/zed-buffer-rpc.sock")
+        );
     }
 }
