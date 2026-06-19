@@ -23,6 +23,7 @@ members = [
     "crates/benchmarks",
     "crates/breadcrumbs",
     "crates/buffer_diff",
+    "crates/buffer_rpc",
     "crates/call",
     "crates/channel",
     "crates/cli",
