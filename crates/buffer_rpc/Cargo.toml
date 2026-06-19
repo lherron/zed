@@ -24,6 +24,7 @@ serde.workspace = true
 serde_json.workspace = true
 text.workspace = true
 thiserror.workspace = true
+ts-rs = { version = "12.0.1", features = ["serde-json-impl"] }
 workspace.workspace = true
 worktree.workspace = true
 

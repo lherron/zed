@@ -66,7 +66,8 @@ pub enum PositionError {
 ///
 /// Both `line` and `character` are **0-indexed**.  When `offset` is present the
 /// server uses it directly and ignores `{line, character}`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct Position {
     /// 0-indexed line number.
     pub line: u32,
@@ -75,12 +76,14 @@ pub struct Position {
     /// Optional byte offset in the document text.  When present, takes
     /// precedence over `{line, character}`.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
     pub offset: Option<usize>,
 }
 
 /// Wire-format range expressed as two [`Position`]s (both 0-indexed, inclusive
 /// start / exclusive end following LSP convention).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct Range {
     pub start: Position,
     pub end: Position,
@@ -91,7 +94,8 @@ pub struct Range {
 /// A dense `Vec<u32>` where index `i` holds the highest sequence number
 /// observed for replica `i`.  Trailing zeroes are stripped on encode and
 /// implied as zero on decode.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct WireVersion(pub Vec<u32>);
 
 // ── Conversion helpers ────────────────────────────────────────────────────────
