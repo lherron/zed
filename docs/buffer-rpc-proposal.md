@@ -45,7 +45,7 @@ Two deliverables, two repos:
   - `MAX_FRAME_BYTES` — reject + close on oversized `Content-Length` (before allocating).
   - `MAX_INBOUND_QUEUED` — cap pending parsed requests per connection; close on overflow.
   - `MAX_OUTBOUND_QUEUED` — cap queued notifications per connection; **drop-and-close** a
-    subscriber that can't keep up rather than growing unbounded (constraint 8/risk: stalled
+    subscriber that can't keep up rather than growing unbounded (test 8 / risk: stalled
     subscriber).
   - Malformed headers/JSON → close the connection cleanly; never panic the app.
 
@@ -138,8 +138,10 @@ apply `Buffer::edit`, then `end_transaction_with_source(...)`.
 
 Edit **source** is explicit. RPC edits are emitted as **`BufferEditSource::Agent`** by
 default (never `User` — that would pollute edit-prediction / action-log / undo grouping).
-The protocol exposes an optional `source` field for future differentiation, defaulting to
-`Agent`.
+The protocol exposes an optional `source` field for future differentiation, but **M0–M2
+default it to `Agent` and reject unsupported values**. Arbitrary client-selected sources are
+**not** passed through to `BufferEditSource::User` — that would require a separate justified
+reason and its own test.
 
 ---
 
@@ -222,11 +224,11 @@ snap.version();                                  // :2265
 
 // buffer/edit  — the core (constraint 2: one transaction, source = Agent, NOT User)
 buffer.update(cx, |b, cx| {
-    b.finalize_last_transaction();               // don't merge into prior user group
+    b.finalize_last_transaction(cx);             // don't merge into prior user group
     b.start_transaction();                       // crates/language/src/buffer.rs:2882
     b.edit(edits, autoindent, cx);               // :2679 — S: usize|Point|PointUtf16|Anchor
-    b.end_transaction_with_source(                // :3154 area; mirrors agent edit path
-        cx, BufferEditSource::Agent);            // crates/language/src/buffer.rs:300
+    b.end_transaction_with_source(               // signature: (source, cx); mirrors agent path
+        BufferEditSource::Agent, cx);            // crates/language/src/buffer.rs:300
 });
 // baseVersion check happens BEFORE this block; on stale version → Conflict, no edit.
 
@@ -347,9 +349,10 @@ states hidden RPC buffers have no LSP guarantee until opened/registered (current
 1. **Multi-workspace addressing → explicit + `current-active` sentinel.** `workspace` is
    required on all buffer ops; pass a concrete `workspaceId` or `"current-active"`. Server also
    exposes `workspace/active` and an `active` flag on `workspace/list`. (See §2.)
-2. **Opening files outside any worktree → auto-add worktree.** `buffer/open` on an abs path
-   calls `find_or_create_worktree(..., visible: false)` so any file is reachable without
-   cluttering the UI. (See §3 mapping.)
+2. **Opening files outside any worktree → use the `open_local_buffer` seam.** `buffer/open`
+   on an absolute local path goes through `Project::open_local_buffer` (which creates the
+   invisible worktree itself); direct `ProjectPath` handling is reserved for paths already
+   resolved into a worktree. No duplication of `find_or_create_worktree` logic. (See §3 mapping.)
 3. **First milestone depth → full, including live watch.** Ship M0–M5 (read + write + save +
    subscribe/didChange + anchors) before calling it done.
 
