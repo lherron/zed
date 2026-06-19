@@ -525,6 +525,9 @@ fn main() {
         git_hosting_providers::init(cx);
 
         OpenListener::set_global(cx, open_listener.clone());
+        if let Some(path) = buffer_rpc::socket_path_from_env_or_settings(cx) {
+            buffer_rpc::init(path, cx);
+        }
 
         extension::init(cx);
         let extension_host_proxy = ExtensionHostProxy::global(cx);

@@ -21,6 +21,8 @@
 
 use thiserror::Error;
 
+const MAX_HEADER_BYTES: usize = 8 * 1024;
+
 // ── Reliability-bound constants ───────────────────────────────────────────────
 
 /// Maximum body size for a single frame, in bytes.
@@ -90,11 +92,30 @@ pub enum FramingError {
 /// - [`FramingError::MalformedHeader`] — if the block does not contain a
 ///   valid `Content-Length: <N>` line.
 /// - [`FramingError::Oversized`] — if the value exceeds [`MAX_FRAME_BYTES`].
-#[allow(clippy::todo)]
-pub fn parse_content_length(_header_block: &[u8]) -> Result<usize, FramingError> {
-    todo!(
-        "parse_content_length: scan header_block for 'Content-Length: N\\r\\n', return N or error"
-    )
+pub fn parse_content_length(header_block: &[u8]) -> Result<usize, FramingError> {
+    if !header_block.ends_with(b"\r\n\r\n") {
+        return Err(FramingError::MalformedHeader);
+    }
+
+    let header = std::str::from_utf8(header_block).map_err(|_| FramingError::MalformedHeader)?;
+    for line in header.trim_end_matches("\r\n\r\n").split("\r\n") {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+
+        if name.eq_ignore_ascii_case("Content-Length") {
+            let claimed = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| FramingError::MalformedHeader)?;
+            if claimed > MAX_FRAME_BYTES {
+                return Err(FramingError::Oversized { claimed });
+            }
+            return Ok(claimed);
+        }
+    }
+
+    Err(FramingError::MalformedHeader)
 }
 
 /// Streaming frame decoder for the LSP `Content-Length` wire format.
@@ -132,9 +153,30 @@ impl FrameDecoder {
     /// # Invariant
     /// Oversized frames are rejected as soon as the header is fully buffered —
     /// the body bytes need not have arrived.
-    #[allow(clippy::todo)]
-    pub fn push(&mut self, _data: &[u8]) -> Result<Vec<Frame>, FramingError> {
-        todo!("FrameDecoder::push: append data to buf, parse frames in a loop, return them")
+    pub fn push(&mut self, data: &[u8]) -> Result<Vec<Frame>, FramingError> {
+        self.buf.extend_from_slice(data);
+        let mut frames = Vec::new();
+
+        loop {
+            let Some(header_end) = self.buf.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                if self.buf.len() > MAX_HEADER_BYTES {
+                    return Err(FramingError::MalformedHeader);
+                }
+                return Ok(frames);
+            };
+
+            let body_start = header_end + 4;
+            let body_len = parse_content_length(&self.buf[..body_start])?;
+            let frame_len = body_start + body_len;
+            if self.buf.len() < frame_len {
+                return Ok(frames);
+            }
+
+            let body = self.buf[body_start..frame_len].to_vec();
+            self.buf.drain(..frame_len);
+            frames.push(Frame { body });
+        }
     }
 }
 
@@ -145,9 +187,12 @@ impl FrameDecoder {
 /// Content-Length: N\r\n\r\n<body>
 /// ```
 /// where `N` is `body.len()` in decimal ASCII.
-#[allow(clippy::todo)]
-pub fn encode_frame(_body: &[u8]) -> Vec<u8> {
-    todo!("encode_frame: write 'Content-Length: N\\r\\n\\r\\n' then body")
+pub fn encode_frame(body: &[u8]) -> Vec<u8> {
+    let header = format!("Content-Length: {}\r\n\r\n", body.len());
+    let mut frame = Vec::with_capacity(header.len() + body.len());
+    frame.extend_from_slice(header.as_bytes());
+    frame.extend_from_slice(body);
+    frame
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

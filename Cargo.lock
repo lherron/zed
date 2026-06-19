@@ -2504,6 +2504,12 @@ dependencies = [
 name = "buffer_rpc"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "futures 0.3.32",
+ "gpui",
+ "release_channel",
+ "serde",
+ "serde_json",
  "thiserror 2.0.17",
 ]
 
@@ -22923,6 +22929,7 @@ dependencies = [
  "auto_update",
  "auto_update_ui",
  "breadcrumbs",
+ "buffer_rpc",
  "call",
  "channel",
  "chrono",
