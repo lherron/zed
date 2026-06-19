@@ -243,6 +243,37 @@ pub fn decode_version(wire: WireVersion) -> Global {
     version
 }
 
+// ── Staleness gate (constraint 3) ────────────────────────────────────────────
+
+/// True iff `current` has observed operations beyond `base`.
+///
+/// When an RPC `buffer/edit` caller supplies an optional `baseVersion`, the
+/// handler compares it against the buffer's live version (`current`) using
+/// this predicate.  If `version_is_stale` returns `true`, the buffer has
+/// advanced past what the caller last saw — the edit **must be rejected** with
+/// a typed `Conflict` error carrying the current version, and NO mutation is
+/// performed.  The caller must re-read the buffer and retry.
+///
+/// # Semantics
+///
+/// Staleness is unidirectional: we ask whether `current` has moved ahead of
+/// `base` on at least one replica.  Formally this is `current.changed_since(base)`.
+///
+/// - `base == current` (identical observation set) → **not stale** — the edit
+///   may proceed.
+/// - `current` has a higher sequence number on any replica already in `base`
+///   (e.g. `base={r0:1}`, `current={r0:2}`) → **stale** — reject.
+/// - `current` has observed an operation on a replica absent from `base`
+///   (e.g. `base={r0:1}`, `current={r0:1, r1:1}`) → **stale** — reject.
+/// - Both `base` and `current` are empty → **not stale** — trivially safe.
+/// - `base` is empty but `current` is not → **stale** — the buffer has
+///   received operations the caller has never seen.
+///
+/// This is spec §2 constraint 3 — no silent rebase.
+pub fn version_is_stale(_base: &Global, _current: &Global) -> bool {
+    unimplemented!("M2 — version_is_stale: awaiting impl in handlers (constraint 3 gate)")
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -538,5 +569,105 @@ mod tests {
         let json = serde_json::to_string(&wire).unwrap();
         let decoded: WireVersion = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, wire);
+    }
+}
+
+// ── RED tests: version_is_stale (M2 TDD — constraint 3) ──────────────────────
+//
+// These tests are intentionally RED until `version_is_stale` is implemented in
+// M2.  The predicate body is `unimplemented!()`, so each test panics with that
+// message — confirming the function signature is wired in and the test logic is
+// correct.  When Larry implements `version_is_stale`, all five must turn GREEN
+// without touching these test bodies.
+//
+// Run to confirm RED:
+//   cargo test -p buffer_rpc version_is_stale
+#[cfg(test)]
+mod version_staleness_tests {
+    use super::version_is_stale;
+    use clock::{Global, Lamport, ReplicaId};
+
+    /// Convenience: build a [`Global`] from (replica_id_u16, seq) pairs.
+    fn v(entries: &[(u16, u32)]) -> Global {
+        let mut g = Global::new();
+        for &(id, seq) in entries {
+            g.observe(Lamport {
+                replica_id: ReplicaId::new(id),
+                value: seq,
+            });
+        }
+        g
+    }
+
+    /// base == current (same observed set) → NOT stale.
+    ///
+    /// The caller's declared baseVersion exactly matches the live buffer
+    /// version; the edit may proceed.
+    #[test]
+    fn test_identical_versions_not_stale() {
+        let base = v(&[(0, 3), (1, 1)]);
+        let current = v(&[(0, 3), (1, 1)]);
+        // Both empty AND identical non-empty vectors are not stale.
+        assert!(
+            !version_is_stale(&base, &current),
+            "identical versions must NOT be stale"
+        );
+    }
+
+    /// Empty base vs empty current → NOT stale.
+    ///
+    /// A brand-new buffer with no operations observed; the caller also has no
+    /// base version — trivially safe.
+    #[test]
+    fn test_both_empty_not_stale() {
+        let base = Global::new();
+        let current = Global::new();
+        assert!(
+            !version_is_stale(&base, &current),
+            "two empty versions must NOT be stale"
+        );
+    }
+
+    /// current strictly dominates base on the SAME replica → STALE.
+    ///
+    /// base={r0:1}, current={r0:2} — the buffer received one more operation
+    /// from replica 0 after the caller last read it.  The edit must be rejected.
+    #[test]
+    fn test_same_replica_advance_is_stale() {
+        let base = v(&[(0, 1)]);
+        let current = v(&[(0, 2)]);
+        assert!(
+            version_is_stale(&base, &current),
+            "current={{r0:2}} advanced past base={{r0:1}} — must be STALE"
+        );
+    }
+
+    /// current observed an operation on a DIFFERENT replica absent from base → STALE.
+    ///
+    /// base={r0:1}, current={r0:1, r1:1} — replica 1 sent an operation the
+    /// caller has never seen.  The edit must be rejected.
+    #[test]
+    fn test_new_replica_in_current_is_stale() {
+        let base = v(&[(0, 1)]);
+        let current = v(&[(0, 1), (1, 1)]);
+        assert!(
+            version_is_stale(&base, &current),
+            "current has observed r1:1 which base has not — must be STALE"
+        );
+    }
+
+    /// Empty base ({}) vs non-empty current → STALE.
+    ///
+    /// The caller declared no baseVersion (or a zero vector), but the buffer
+    /// has already received operations.  Per constraint 3 the edit must be
+    /// rejected — the caller should re-read and retry with the real base.
+    #[test]
+    fn test_empty_base_nonempty_current_is_stale() {
+        let base = Global::new();
+        let current = v(&[(0, 1)]);
+        assert!(
+            version_is_stale(&base, &current),
+            "current={{r0:1}} has advanced past empty base — must be STALE"
+        );
     }
 }
