@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, SyncSender, TrySendError},
     },
     thread,
@@ -19,18 +19,31 @@ use futures::channel::mpsc as futures_mpsc;
 
 use crate::{
     framing::{FrameDecoder, MAX_INBOUND_QUEUED, MAX_OUTBOUND_QUEUED, encode_frame},
-    protocol::{Request, Response},
+    protocol::{Notification, Outbound, Request, Response},
 };
+
+/// Monotonic per-connection id, used to key a connection's subscriptions in the
+/// server's global registry so they can be torn down when the connection drops.
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+/// A message handed to the foreground drain loop: either an inbound request or
+/// the teardown signal for a connection whose reader has ended.
+pub enum Incoming {
+    Request(RequestEnvelope),
+    Disconnected { conn_id: u64 },
+}
 
 pub struct RequestEnvelope {
     pub request: Request,
     pub responder: Responder,
+    pub conn_id: u64,
+    pub sink: NotificationSink,
     _permit: InboundPermit,
 }
 
 #[derive(Clone)]
 pub struct Responder {
-    outbound_tx: SyncSender<Response>,
+    outbound_tx: SyncSender<Outbound>,
     close_handle: CloseHandle,
 }
 
@@ -40,10 +53,48 @@ impl Responder {
             return;
         };
 
-        match self.outbound_tx.try_send(response) {
+        match self.outbound_tx.try_send(Outbound::Response(response)) {
             Ok(()) => {}
             Err(TrySendError::Disconnected(_)) | Err(TrySendError::Full(_)) => {
                 self.close_handle.close();
+            }
+        }
+    }
+}
+
+/// A handle the subscription machinery uses to push server-initiated
+/// notifications onto a specific connection's bounded outbound queue.
+///
+/// Cloneable and `Send`/`'static`, so it can be captured by a `cx.subscribe`
+/// closure on the foreground.
+#[derive(Clone)]
+pub struct NotificationSink {
+    conn_id: u64,
+    outbound_tx: SyncSender<Outbound>,
+    close_handle: CloseHandle,
+}
+
+impl NotificationSink {
+    pub fn conn_id(&self) -> u64 {
+        self.conn_id
+    }
+
+    /// Try to enqueue a notification.
+    ///
+    /// Returns `true` if it was accepted into the bounded queue (the caller may
+    /// then advance its delivery cursor). On a full queue (a subscriber that
+    /// can't keep up — constraint 5 / test 8) or a disconnected channel, the
+    /// connection is **dropped and closed** and this returns `false`; the caller
+    /// must NOT advance its cursor past the unsent notification.
+    pub fn notify(&self, notification: Notification) -> bool {
+        match self
+            .outbound_tx
+            .try_send(Outbound::Notification(notification))
+        {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                self.close_handle.close();
+                false
             }
         }
     }
@@ -84,7 +135,7 @@ impl Drop for InboundPermit {
     }
 }
 
-pub fn start(path: PathBuf) -> Result<futures_mpsc::UnboundedReceiver<RequestEnvelope>> {
+pub fn start(path: PathBuf) -> Result<futures_mpsc::UnboundedReceiver<Incoming>> {
     prepare_socket_path(&path)?;
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("binding Buffer RPC socket {}", path.display()))?;
@@ -121,10 +172,7 @@ fn prepare_socket_path(path: &Path) -> Result<()> {
     }
 }
 
-fn accept_loop(
-    listener: UnixListener,
-    requests_tx: futures_mpsc::UnboundedSender<RequestEnvelope>,
-) {
+fn accept_loop(listener: UnixListener, requests_tx: futures_mpsc::UnboundedSender<Incoming>) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else {
             break;
@@ -137,16 +185,14 @@ fn accept_loop(
     }
 }
 
-fn handle_connection(
-    stream: UnixStream,
-    requests_tx: futures_mpsc::UnboundedSender<RequestEnvelope>,
-) {
+fn handle_connection(stream: UnixStream, requests_tx: futures_mpsc::UnboundedSender<Incoming>) {
     let Ok(writer_stream) = stream.try_clone() else {
         return;
     };
     let Ok(close_stream) = stream.try_clone() else {
         return;
     };
+    let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
     let (outbound_tx, outbound_rx) = mpsc::sync_channel(MAX_OUTBOUND_QUEUED);
     let close_handle = CloseHandle::new(close_stream);
     let writer = thread::Builder::new()
@@ -155,14 +201,23 @@ fn handle_connection(
 
     read_loop(
         stream,
-        requests_tx,
+        &requests_tx,
+        conn_id,
         Responder {
+            outbound_tx: outbound_tx.clone(),
+            close_handle: close_handle.clone(),
+        },
+        NotificationSink {
+            conn_id,
             outbound_tx,
             close_handle: close_handle.clone(),
         },
         Arc::new(AtomicUsize::new(0)),
     );
     close_handle.close();
+
+    // Tell the foreground to tear down this connection's subscriptions.
+    let _ = requests_tx.unbounded_send(Incoming::Disconnected { conn_id });
 
     if let Ok(writer) = writer {
         let _ = writer.join();
@@ -171,8 +226,10 @@ fn handle_connection(
 
 fn read_loop(
     mut stream: UnixStream,
-    requests_tx: futures_mpsc::UnboundedSender<RequestEnvelope>,
+    requests_tx: &futures_mpsc::UnboundedSender<Incoming>,
+    conn_id: u64,
     responder: Responder,
+    sink: NotificationSink,
     pending_requests: Arc<AtomicUsize>,
 ) {
     let mut decoder = FrameDecoder::new();
@@ -204,18 +261,23 @@ fn read_loop(
             let envelope = RequestEnvelope {
                 request,
                 responder: responder.clone(),
+                conn_id,
+                sink: sink.clone(),
                 _permit: InboundPermit(pending_requests.clone()),
             };
-            if requests_tx.unbounded_send(envelope).is_err() {
+            if requests_tx
+                .unbounded_send(Incoming::Request(envelope))
+                .is_err()
+            {
                 return;
             }
         }
     }
 }
 
-fn write_loop(mut stream: UnixStream, outbound_rx: mpsc::Receiver<Response>) {
-    for response in outbound_rx {
-        let Ok(body) = serde_json::to_vec(&response) else {
+fn write_loop(mut stream: UnixStream, outbound_rx: mpsc::Receiver<Outbound>) {
+    for message in outbound_rx {
+        let Ok(body) = serde_json::to_vec(&message) else {
             return;
         };
         let frame = encode_frame(&body);

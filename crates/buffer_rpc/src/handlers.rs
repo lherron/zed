@@ -16,22 +16,37 @@ use std::{
 };
 
 use gpui::{App, AsyncApp, Entity, Task};
-use language::{AutoindentMode, Buffer, BufferEditSource};
+use language::{AutoindentMode, Buffer, BufferEditSource, BufferEvent};
 use project::Project;
 use release_channel::{AppVersion, ReleaseChannel};
+use text::{Bias, ToOffset as _};
 use workspace::MultiWorkspace;
 
-use crate::BufferRpcServer;
+use crate::notify::{decode_anchor, encode_anchor, encode_changes_since};
 use crate::positions::{
-    Position, Range, decode_version, encode_version, point_utf16_to_offset, version_is_stale,
+    Position, Range, decode_version, encode_version, offset_to_point_utf16, point_utf16_to_offset,
+    version_is_stale,
 };
 use crate::protocol::{
-    BufferEdit, BufferEditParams, BufferEditResult, BufferInfo, BufferOpenParams, BufferOpenResult,
-    BufferSaveParams, BufferSaveResult, BufferTextParams, BufferTextResult, CONFLICT,
-    CURRENT_ACTIVE, ConflictErrorData, InitializeParams, InitializeResult, PROTOCOL_VERSION,
-    PingResult, Request, Response, STALE_WORKSPACE, SavedMtime, WorkspaceActiveResult,
-    WorkspaceInfo, WorkspaceTargetParams, same_protocol_major,
+    AnchorCreateParams, AnchorCreateResult, AnchorResolveParams, AnchorResolveResult, BufferEdit,
+    BufferEditParams, BufferEditResult, BufferInfo, BufferOpenParams, BufferOpenResult,
+    BufferSaveParams, BufferSaveResult, BufferSubscribeParams, BufferSubscribeResult,
+    BufferTextParams, BufferTextResult, BufferUnsubscribeParams, BufferUnsubscribeResult, CONFLICT,
+    CURRENT_ACTIVE, ConflictErrorData, DidChangeParams, DidCloseParams, DidOpenParams,
+    DidSaveParams, InitializeParams, InitializeResult, METHOD_DID_CHANGE, METHOD_DID_CLOSE,
+    METHOD_DID_OPEN, METHOD_DID_SAVE, Notification, PROTOCOL_VERSION, PingResult, Request,
+    Response, STALE_WORKSPACE, SavedMtime, WireBias, WorkspaceActiveResult, WorkspaceInfo,
+    WorkspaceTargetParams, same_protocol_major,
 };
+use crate::transport::NotificationSink;
+use crate::{BufferRpcServer, SubscriptionEntry};
+
+/// Per-connection context handed to [`dispatch`]: the connection id (used to key
+/// subscriptions for teardown) and the sink for server-initiated notifications.
+pub struct ConnCtx {
+    pub conn_id: u64,
+    pub sink: NotificationSink,
+}
 
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -44,7 +59,7 @@ type Id = Option<serde_json::Value>;
 ///
 /// Runs on the foreground drain task; `cx` is the app's async handle.  Sync
 /// entity reads use `cx.update(...)`; async buffer opens are awaited here.
-pub async fn dispatch(request: Request, cx: &mut AsyncApp) -> Option<Response> {
+pub async fn dispatch(request: Request, conn: &ConnCtx, cx: &mut AsyncApp) -> Option<Response> {
     if request.jsonrpc != crate::protocol::JSONRPC_VERSION {
         return Some(Response::error(
             request.id,
@@ -64,6 +79,10 @@ pub async fn dispatch(request: Request, cx: &mut AsyncApp) -> Option<Response> {
         "buffer/text" => cx.update(|cx| buffer_text(id, request.params, cx)),
         "buffer/edit" => cx.update(|cx| buffer_edit(id, request.params, cx)),
         "buffer/save" => buffer_save(id, request.params, cx).await,
+        "buffer/subscribe" => cx.update(|cx| buffer_subscribe(id, request.params, conn, cx)),
+        "buffer/unsubscribe" => cx.update(|cx| buffer_unsubscribe(id, request.params, conn, cx)),
+        "anchor/create" => cx.update(|cx| anchor_create(id, request.params, cx)),
+        "anchor/resolve" => cx.update(|cx| anchor_resolve(id, request.params, cx)),
         _ => Response::error(id, METHOD_NOT_FOUND, "method not found"),
     };
     Some(response)
@@ -533,6 +552,235 @@ fn find_project_for_buffer(buffer_id: u64, cx: &mut App) -> Option<Entity<Projec
         }
     }
     None
+}
+
+// ── buffer/subscribe + notifications (M3) ────────────────────────────────────
+
+/// Register a `cx.subscribe` on the buffer that streams `buffer/didChange`
+/// (constraint 4) and `buffer/didSave` to this connection, plus an
+/// `observe_release` that emits `buffer/didClose`. Returns an explicit baseline
+/// `{version, text}` the subscriber is expected to hold (captured atomically
+/// with registration — no edit can interleave inside this synchronous update).
+fn buffer_subscribe(
+    id: Id,
+    params: Option<serde_json::Value>,
+    conn: &ConnCtx,
+    cx: &mut App,
+) -> Response {
+    let params = match parse_params::<BufferSubscribeParams>(params) {
+        Ok(params) => params,
+        Err(make_error) => return make_error(id),
+    };
+    let buffer_id = params.buffer_id;
+
+    let Some(buffer) = find_buffer(buffer_id, cx) else {
+        return Response::error(id, INVALID_PARAMS, "unknown bufferId");
+    };
+
+    // Atomic baseline: the subscriber holds exactly this text at this version,
+    // and the delivery cursor starts here. gpui defers subscription activation,
+    // so the first delivered event diffs forward from this baseline with no gap.
+    let baseline = buffer.read(cx).text_snapshot();
+    let baseline_version = baseline.version().clone();
+    let baseline_text = baseline.text();
+    let path = buffer
+        .read(cx)
+        .file()
+        .map(|file| file.full_path(cx).to_string_lossy().into_owned());
+
+    // didChange / didSave stream. `last_sent` is the per-subscriber delivery
+    // cursor; advance ONLY when a didChange is accepted into the bounded queue.
+    let mut last_sent = baseline_version.clone();
+    let event_sink = conn.sink.clone();
+    let event = cx.subscribe(&buffer, move |buffer, event, cx| match event {
+        BufferEvent::Edited { source } => {
+            let snapshot = buffer.read(cx).text_snapshot();
+            let changes = encode_changes_since(&snapshot, &last_sent);
+            if changes.is_empty() {
+                return;
+            }
+            let notification = Notification::new(
+                METHOD_DID_CHANGE,
+                DidChangeParams {
+                    buffer_id,
+                    version: encode_version(snapshot.version()),
+                    changes,
+                    is_local: source.is_local(),
+                },
+            );
+            if event_sink.notify(notification) {
+                last_sent = snapshot.version().clone();
+            }
+            // On a full/closed queue the subscriber is dropped+closed by the
+            // sink; the cursor is NOT advanced past the unsent notification.
+        }
+        BufferEvent::Saved => {
+            let buffer = buffer.read(cx);
+            let notification = Notification::new(
+                METHOD_DID_SAVE,
+                DidSaveParams {
+                    buffer_id,
+                    version: encode_version(&buffer.version()),
+                    saved_mtime: buffer
+                        .saved_mtime()
+                        .and_then(|mtime| mtime.to_seconds_and_nanos_for_persistence())
+                        .map(|(secs_since_epoch, nanos_since_epoch)| SavedMtime {
+                            secs_since_epoch,
+                            nanos_since_epoch,
+                        }),
+                },
+            );
+            event_sink.notify(notification);
+        }
+        _ => {}
+    });
+
+    // didClose when the buffer entity is released (no strong refs remain).
+    let release_sink = conn.sink.clone();
+    let release = cx.observe_release(&buffer, move |_buffer, _cx| {
+        release_sink.notify(Notification::new(
+            METHOD_DID_CLOSE,
+            DidCloseParams { buffer_id },
+        ));
+    });
+
+    if cx.has_global::<BufferRpcServer>() {
+        cx.global_mut::<BufferRpcServer>().register_subscription(
+            conn.conn_id,
+            buffer_id,
+            SubscriptionEntry { event, release },
+        );
+    }
+
+    // didOpen, so the subscriber learns the path alongside the baseline.
+    conn.sink.notify(Notification::new(
+        METHOD_DID_OPEN,
+        DidOpenParams { buffer_id, path },
+    ));
+
+    Response::result(
+        id,
+        BufferSubscribeResult {
+            buffer_id,
+            version: encode_version(&baseline_version),
+            text: baseline_text,
+        },
+    )
+}
+
+/// Drop a `(conn, buffer)` subscription. Idempotent: `ok` is true whether or not
+/// a registration existed.
+fn buffer_unsubscribe(
+    id: Id,
+    params: Option<serde_json::Value>,
+    conn: &ConnCtx,
+    cx: &mut App,
+) -> Response {
+    let params = match parse_params::<BufferUnsubscribeParams>(params) {
+        Ok(params) => params,
+        Err(make_error) => return make_error(id),
+    };
+
+    if cx.has_global::<BufferRpcServer>() {
+        cx.global_mut::<BufferRpcServer>()
+            .remove_subscription(conn.conn_id, params.buffer_id);
+    }
+
+    Response::result(id, BufferUnsubscribeResult { ok: true })
+}
+
+// ── anchor/create + anchor/resolve (M3) ──────────────────────────────────────
+
+fn anchor_create(id: Id, params: Option<serde_json::Value>, cx: &mut App) -> Response {
+    let params = match parse_params::<AnchorCreateParams>(params) {
+        Ok(params) => params,
+        Err(make_error) => return make_error(id),
+    };
+
+    let Some(buffer) = find_buffer(params.buffer_id, cx) else {
+        return Response::error(id, INVALID_PARAMS, "unknown bufferId");
+    };
+
+    let snapshot = buffer.read(cx).text_snapshot();
+    let text = snapshot.text();
+    let offset = match offset_of(&text, &params.position) {
+        Ok(offset) => offset,
+        Err(message) => return Response::error(id, INVALID_PARAMS, message),
+    };
+    if !text.is_char_boundary(offset) {
+        return Response::error(
+            id,
+            INVALID_PARAMS,
+            "anchor position does not fall on a UTF-8 char boundary",
+        );
+    }
+
+    let bias = match params.bias {
+        Some(WireBias::Left) => Bias::Left,
+        Some(WireBias::Right) | None => Bias::Right,
+    };
+    let anchor = snapshot.anchor_at(offset, bias);
+
+    Response::result(
+        id,
+        AnchorCreateResult {
+            anchor: encode_anchor(&anchor),
+        },
+    )
+}
+
+fn anchor_resolve(id: Id, params: Option<serde_json::Value>, cx: &mut App) -> Response {
+    let params = match parse_params::<AnchorResolveParams>(params) {
+        Ok(params) => params,
+        Err(make_error) => return make_error(id),
+    };
+
+    let Some(buffer) = find_buffer(params.buffer_id, cx) else {
+        return Response::error(id, INVALID_PARAMS, "unknown bufferId");
+    };
+
+    let anchor = match decode_anchor(&params.anchor) {
+        Ok(anchor) => anchor,
+        Err(error) => {
+            return Response::error(id, INVALID_PARAMS, format!("invalid anchor token: {error}"));
+        }
+    };
+
+    let snapshot = buffer.read(cx).text_snapshot();
+
+    // A token for a different buffer, or whose insertion this snapshot has not
+    // observed, resolves to `valid: false` rather than an error or a panic.
+    if anchor.buffer_id.to_proto() != params.buffer_id || !snapshot.can_resolve(&anchor) {
+        return Response::result(
+            id,
+            AnchorResolveResult {
+                position: Position {
+                    line: 0,
+                    character: 0,
+                    offset: None,
+                },
+                valid: false,
+            },
+        );
+    }
+
+    let offset = anchor.to_offset(&snapshot);
+    let (line, character) = match offset_to_point_utf16(&snapshot.text(), offset) {
+        Ok(point) => point,
+        Err(error) => return Response::error(id, INTERNAL_ERROR, error.to_string()),
+    };
+
+    Response::result(
+        id,
+        AnchorResolveResult {
+            position: Position {
+                line,
+                character,
+                offset: Some(offset),
+            },
+            valid: true,
+        },
+    )
 }
 
 /// Slice `text` to the byte range described by `range`.

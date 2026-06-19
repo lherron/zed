@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::positions::{Range, WireVersion};
+use crate::positions::{Position, Range, WireVersion};
 
 pub const JSONRPC_VERSION: &str = "2.0";
 pub const PROTOCOL_VERSION: &str = "0.1.0";
@@ -299,6 +299,187 @@ pub struct ConflictErrorData {
     pub current_version: WireVersion,
 }
 
+// ── M3 notification / subscription / anchor types ───────────────────────────
+
+use crate::notify::{WireAnchorToken, WireChange};
+
+/// A server→client JSON-RPC 2.0 notification (no `id`).
+///
+/// Emitted on a subscribed connection's bounded outbound channel for
+/// `buffer/didChange`, `buffer/didSave`, `buffer/didOpen`, `buffer/didClose`.
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct Notification {
+    pub jsonrpc: &'static str,
+    pub method: String,
+    pub params: Value,
+}
+
+impl Notification {
+    pub fn new(method: impl Into<String>, params: impl Serialize) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION,
+            method: method.into(),
+            params: serde_json::to_value(params).unwrap_or(Value::Null),
+        }
+    }
+}
+
+/// A message the transport's writer half serialises to the socket: either a
+/// reply to a request or a server-initiated notification. Serialised untagged
+/// so each variant emits its own JSON-RPC shape.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum Outbound {
+    Response(Response),
+    Notification(Notification),
+}
+
+pub const METHOD_DID_CHANGE: &str = "buffer/didChange";
+pub const METHOD_DID_SAVE: &str = "buffer/didSave";
+pub const METHOD_DID_OPEN: &str = "buffer/didOpen";
+pub const METHOD_DID_CLOSE: &str = "buffer/didClose";
+
+/// Params for `buffer/subscribe`.
+#[derive(Debug, Clone, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BufferSubscribeParams {
+    #[ts(type = "number")]
+    pub buffer_id: u64,
+}
+
+/// Result of `buffer/subscribe`.
+///
+/// Establishes the **baseline** the subscriber is expected to hold: `text` is
+/// the buffer contents at `version`, captured atomically with the subscription
+/// registration. The client stores `text` as its current document and the
+/// server initialises that subscriber's delivery cursor to `version`; every
+/// subsequent `buffer/didChange` diffs forward from there (ranges in the
+/// client's held frame). No edit can interleave between this snapshot and the
+/// first delivered notification.
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BufferSubscribeResult {
+    #[ts(type = "number")]
+    pub buffer_id: u64,
+    pub version: WireVersion,
+    pub text: String,
+}
+
+/// Params for `buffer/unsubscribe`.
+#[derive(Debug, Clone, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BufferUnsubscribeParams {
+    #[ts(type = "number")]
+    pub buffer_id: u64,
+}
+
+/// Result of `buffer/unsubscribe`.
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct BufferUnsubscribeResult {
+    pub ok: bool,
+}
+
+/// Anchor bias on the wire (`Left` ≈ `anchor_before`, `Right` ≈ `anchor_after`).
+#[derive(Debug, Clone, Copy, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum WireBias {
+    Left,
+    Right,
+}
+
+/// Params for `anchor/create`.
+#[derive(Debug, Clone, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AnchorCreateParams {
+    #[ts(type = "number")]
+    pub buffer_id: u64,
+    pub position: Position,
+    /// Defaults to `Right` (stick after inserted text) when absent.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub bias: Option<WireBias>,
+}
+
+/// Result of `anchor/create`.
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct AnchorCreateResult {
+    pub anchor: WireAnchorToken,
+}
+
+/// Params for `anchor/resolve`.
+#[derive(Debug, Clone, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AnchorResolveParams {
+    #[ts(type = "number")]
+    pub buffer_id: u64,
+    pub anchor: WireAnchorToken,
+}
+
+/// Result of `anchor/resolve`.
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct AnchorResolveResult {
+    pub position: Position,
+    pub valid: bool,
+}
+
+/// `buffer/didChange` notification params (constraint 4 — pre-edit frame).
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DidChangeParams {
+    #[ts(type = "number")]
+    pub buffer_id: u64,
+    pub version: WireVersion,
+    /// Changes in the subscriber's held (pre-edit) frame, ordered descending by
+    /// start so naive in-order application reconstructs the new text exactly.
+    pub changes: Vec<WireChange>,
+    pub is_local: bool,
+}
+
+/// `buffer/didSave` notification params.
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DidSaveParams {
+    #[ts(type = "number")]
+    pub buffer_id: u64,
+    pub version: WireVersion,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub saved_mtime: Option<SavedMtime>,
+}
+
+/// `buffer/didOpen` notification params.
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DidOpenParams {
+    #[ts(type = "number")]
+    pub buffer_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub path: Option<String>,
+}
+
+/// `buffer/didClose` notification params.
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DidCloseParams {
+    #[ts(type = "number")]
+    pub buffer_id: u64,
+}
+
 #[cfg(test)]
 mod binding_tests {
     use super::*;
@@ -368,6 +549,24 @@ mod binding_tests {
         export::<BufferSaveResult>(&config)?;
         export::<SavedMtime>(&config)?;
         export::<ConflictErrorData>(&config)?;
+
+        // M3 notification / subscription / anchor surface.
+        export::<crate::notify::WireChange>(&config)?;
+        export::<crate::notify::WireAnchorToken>(&config)?;
+        export::<Notification>(&config)?;
+        export::<BufferSubscribeParams>(&config)?;
+        export::<BufferSubscribeResult>(&config)?;
+        export::<BufferUnsubscribeParams>(&config)?;
+        export::<BufferUnsubscribeResult>(&config)?;
+        export::<WireBias>(&config)?;
+        export::<AnchorCreateParams>(&config)?;
+        export::<AnchorCreateResult>(&config)?;
+        export::<AnchorResolveParams>(&config)?;
+        export::<AnchorResolveResult>(&config)?;
+        export::<DidChangeParams>(&config)?;
+        export::<DidSaveParams>(&config)?;
+        export::<DidOpenParams>(&config)?;
+        export::<DidCloseParams>(&config)?;
 
         strip_trailing_whitespace(&bindings_dir)?;
 

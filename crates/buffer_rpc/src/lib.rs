@@ -23,7 +23,7 @@
 use std::{collections::HashMap, env, path::PathBuf};
 
 use futures::StreamExt;
-use gpui::{App, Entity, Global};
+use gpui::{App, Entity, Global, Subscription};
 use language::Buffer;
 
 pub mod framing;
@@ -43,6 +43,13 @@ pub struct BufferRpcServer {
     /// by `buffer/text` (and later `buffer/edit`/`buffer/save`).  Keyed by the
     /// protocol buffer id (`BufferId::to_proto`).
     opened_buffers: HashMap<u64, OpenedBuffer>,
+    /// Live `buffer/subscribe` registrations, keyed by `(conn_id, buffer_id)`.
+    ///
+    /// Holding the gpui [`Subscription`]s here keeps them active; removing an
+    /// entry drops them and unsubscribes. Connection teardown
+    /// ([`BufferRpcServer::remove_connection`]) clears every entry for that
+    /// connection so a dropped subscriber stops receiving notifications.
+    subscriptions: HashMap<(u64, u64), SubscriptionEntry>,
 }
 
 struct OpenedBuffer {
@@ -50,11 +57,44 @@ struct OpenedBuffer {
     project: Entity<project::Project>,
 }
 
+/// The gpui subscriptions backing one `(conn, buffer)` subscription: buffer
+/// events (didChange/didSave) and the entity-release observer (didClose).
+pub struct SubscriptionEntry {
+    pub event: Subscription,
+    pub release: Subscription,
+}
+
 impl Global for BufferRpcServer {}
 
 impl BufferRpcServer {
     pub fn socket_path(&self) -> &PathBuf {
         &self.socket_path
+    }
+
+    /// Register a `(conn, buffer)` subscription, keeping its gpui subscriptions
+    /// alive. Replaces any prior registration for the same key.
+    pub fn register_subscription(
+        &mut self,
+        conn_id: u64,
+        buffer_id: u64,
+        entry: SubscriptionEntry,
+    ) {
+        self.subscriptions.insert((conn_id, buffer_id), entry);
+    }
+
+    /// Drop a single `(conn, buffer)` subscription. Returns whether one existed.
+    pub fn remove_subscription(&mut self, conn_id: u64, buffer_id: u64) -> bool {
+        self.subscriptions.remove(&(conn_id, buffer_id)).is_some()
+    }
+
+    /// Drop every subscription belonging to a connection (called on disconnect).
+    pub fn remove_connection(&mut self, conn_id: u64) {
+        self.subscriptions.retain(|(conn, _), _| *conn != conn_id);
+    }
+
+    /// Whether a `(conn, buffer)` subscription is currently registered.
+    pub fn is_subscribed(&self, conn_id: u64, buffer_id: u64) -> bool {
+        self.subscriptions.contains_key(&(conn_id, buffer_id))
     }
 
     /// Retain a strong handle to an RPC-opened buffer so it stays alive.
@@ -98,15 +138,36 @@ pub fn init(path: PathBuf, cx: &mut App) {
     cx.set_global(BufferRpcServer {
         socket_path: path,
         opened_buffers: HashMap::new(),
+        subscriptions: HashMap::new(),
     });
     cx.spawn(async move |cx| {
         // Foreground drain task (constraint 1): entity access happens via
         // `cx.update` inside `handlers::dispatch`; async buffer opens are awaited
         // here in the spawned future.  No socket I/O or JSON framing on this
         // thread — the transport's writer half owns all wire encoding.
-        while let Some(request) = requests.next().await {
-            let response = handlers::dispatch(request.request, cx).await;
-            request.responder.respond(response);
+        while let Some(incoming) = requests.next().await {
+            match incoming {
+                transport::Incoming::Request(envelope) => {
+                    let transport::RequestEnvelope {
+                        request,
+                        responder,
+                        conn_id,
+                        sink,
+                        ..
+                    } = envelope;
+                    let conn = handlers::ConnCtx { conn_id, sink };
+                    let response = handlers::dispatch(request, &conn, cx).await;
+                    responder.respond(response);
+                }
+                transport::Incoming::Disconnected { conn_id } => {
+                    let _ = cx.update(|cx| {
+                        if cx.has_global::<BufferRpcServer>() {
+                            cx.global_mut::<BufferRpcServer>()
+                                .remove_connection(conn_id);
+                        }
+                    });
+                }
+            }
         }
     })
     .detach();

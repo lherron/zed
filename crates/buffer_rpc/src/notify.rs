@@ -30,7 +30,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::positions::Range;
+use crate::positions::{Position, Range};
 
 // ── Wire types ─────────────────────────────────────────────────────────────────
 
@@ -81,35 +81,69 @@ pub enum AnchorDecodeError {
 // When the M3 implementer fills in correct bodies the RED tests must turn GREEN
 // without any change to the test bodies.
 
-/// Encode a [`text::EditOperation`] as a sequence of [`WireChange`]s in the
-/// operation's **pre-edit/base coordinate frame**.
+/// Encode the edits between `last_sent_version` and `current`'s version as a
+/// sequence of [`WireChange`]s in the **pre-edit / client coordinate frame**
+/// (constraint 4 — the M3 gate).
+///
+/// `current` is the buffer snapshot captured **after** the mutation (so it must
+/// be taken inside a post-mutation event such as [`language::BufferEvent::Edited`],
+/// never inside an `Operation` callback, which fires before `apply_ops` mutates
+/// the text). `last_sent_version` is the version the subscriber is known to hold
+/// (its delivery cursor — see the subscription handler).
 ///
 /// # Correctness contract (constraint 4 — HARD GATE)
 ///
-/// Each `WireChange.range` MUST be expressed as UTF-16 `{line, character}`
-/// positions into the text of `pre_edit` (the buffer snapshot **before** `op`
-/// was applied).  Applying the returned changes **in order** against the pre-edit
-/// text string MUST yield exactly the post-edit buffer text.
+/// Each `WireChange.range` is the `old` side of a [`text::Edit`] produced by
+/// [`text::BufferSnapshot::edits_since`] — i.e. UTF-16 `{line, character}`
+/// positions in the text the subscriber currently holds (`last_sent_version`).
+/// `new_text` is read from `current` over the edit's `new` range.  Applying the
+/// returned changes against the held text reproduces `current`'s text exactly.
 ///
-/// Ranges derived from the *post-edit* snapshot are **wrong** — they produce
-/// bad patches under deletion, multibyte UTF-16 characters, or concurrent CRDT
-/// operations from other replicas.
+/// This is exact under deletion, multibyte/astral UTF-16, multi-edit batches,
+/// and concurrent CRDT operations because `edits_since` performs the
+/// version-aware fragment-tree diff internally — we never treat a raw
+/// `FullOffset` as a visible byte offset.
 ///
-/// `pre_edit` must be the [`text::BufferSnapshot`] captured immediately before
-/// `op` was applied; for local edits `op.version == pre_edit.version()`.
+/// # Wire ordering convention
 ///
-/// # Implementation notes (for M3 implementer)
-///
-/// `op.ranges` is a `Vec<Range<text::FullOffset>>`.  A [`text::FullOffset`]
-/// counts **all** bytes (visible + deleted) in the fragment tree at the
-/// operation's base version.  Converting to a visible byte offset in `pre_edit`
-/// requires a walk of `pre_edit`'s fragment tree at that version context —
-/// **do not** use `offset_to_point_utf16` on the FullOffset value directly.
-pub fn encode_changes(
-    _pre_edit: &text::BufferSnapshot,
-    _op: &text::EditOperation,
+/// All ranges are in the client's current (pre-batch) frame. The returned
+/// changes are ordered **descending by start position**, so a client may apply
+/// them in array order against its held text (replacing higher offsets first
+/// keeps lower offsets valid). Equivalently they may be applied as a single
+/// simultaneous batch.
+pub fn encode_changes_since(
+    current: &text::BufferSnapshot,
+    last_sent_version: &clock::Global,
 ) -> Vec<WireChange> {
-    unimplemented!("M3: encode EditOperation FullOffset ranges → pre-edit UTF-16 WireChange vec")
+    use text::PointUtf16;
+
+    let mut changes: Vec<WireChange> = current
+        .edits_since::<PointUtf16>(last_sent_version)
+        .map(|edit| {
+            let new_text: String = current
+                .text_for_range(edit.new.start..edit.new.end)
+                .collect();
+            WireChange {
+                range: Range {
+                    start: Position {
+                        line: edit.old.start.row,
+                        character: edit.old.start.column,
+                        offset: None,
+                    },
+                    end: Position {
+                        line: edit.old.end.row,
+                        character: edit.old.end.column,
+                        offset: None,
+                    },
+                },
+                new_text,
+            }
+        })
+        .collect();
+
+    // Descending by start position so naive in-order application is correct.
+    changes.reverse();
+    changes
 }
 
 /// Encode a [`text::Anchor`] to its opaque wire token.
@@ -117,26 +151,61 @@ pub fn encode_changes(
 /// Uses `Anchor::opaque_id()` (20 deterministic bytes) encoded as URL-safe
 /// base64 without padding.  The client stores the resulting [`WireAnchorToken`]
 /// and passes it back verbatim to `anchor/resolve`.
-pub fn encode_anchor(_anchor: &text::Anchor) -> WireAnchorToken {
-    unimplemented!("M3: base64url-encode Anchor::opaque_id() → WireAnchorToken")
+pub fn encode_anchor(anchor: &text::Anchor) -> WireAnchorToken {
+    use base64::Engine as _;
+    let bytes = anchor.opaque_id();
+    WireAnchorToken(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
 /// Decode a [`WireAnchorToken`] back to a [`text::Anchor`].
 ///
 /// Returns [`AnchorDecodeError`] if the token is not valid base64url or the
 /// decoded byte array is not exactly 20 bytes (matching `Anchor::opaque_id()`).
-pub fn decode_anchor(_token: &WireAnchorToken) -> Result<text::Anchor, AnchorDecodeError> {
-    unimplemented!("M3: base64url-decode token → reconstruct Anchor from 20-byte opaque_id layout")
+///
+/// The 20-byte layout mirrors `Anchor::opaque_id()` (all little-endian):
+/// `[0..8]` `buffer_id` (`u64`), `[8..12]` `offset` (`u32`), `[12..16]`
+/// `timestamp.value` (`Seq`/`u32`), `[16..18]` `timestamp.replica_id` (`u16`),
+/// `[18]` `bias` (`0` = Left, else Right), `[19]` unused.
+pub fn decode_anchor(token: &WireAnchorToken) -> Result<text::Anchor, AnchorDecodeError> {
+    use base64::Engine as _;
+
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token.0.as_bytes())
+        .map_err(|error| AnchorDecodeError::InvalidBase64(error.to_string()))?;
+    let bytes: [u8; 20] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| AnchorDecodeError::BadLength(bytes.len()))?;
+
+    let buffer_id_raw = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let offset = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    let value = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    let replica_id = u16::from_le_bytes(bytes[16..18].try_into().unwrap());
+    let bias = if bytes[18] == 0 {
+        text::Bias::Left
+    } else {
+        text::Bias::Right
+    };
+
+    // A zero buffer id can never come from a real `Anchor` (`BufferId` is a
+    // `NonZeroU64`); treat it as a malformed token rather than panicking.
+    let buffer_id =
+        text::BufferId::new(buffer_id_raw).map_err(|_| AnchorDecodeError::BadLength(20))?;
+
+    let timestamp = clock::Lamport {
+        replica_id: clock::ReplicaId::new(replica_id),
+        value,
+    };
+    Ok(text::Anchor::new(timestamp, offset, bias, buffer_id))
 }
 
-// ── Tests (RED — must FAIL until M3 impl fills in the stubs) ──────────────────
+// ── Tests (M3 green — encode_changes_since + anchor codec) ───────────────────
 //
-// Each test calls a stub function and will panic with `unimplemented!()`.
-// This is the expected RED state.  When M3 is implemented:
-//   - All RED tests must turn GREEN without modifying test bodies.
-//   - All 69 existing tests must remain GREEN.
+// The didChange seam was re-pointed (daedalus ruling, Option C) from the
+// originally-stubbed `encode_changes(pre_edit, op)` to
+// `encode_changes_since(current_snapshot, last_sent_version)`: the assertions
+// are unchanged; only the inputs reflect the version-diff design.
 //
-// Run to confirm RED:
 //   cargo test -p buffer_rpc notify
 #[cfg(test)]
 mod tests {
@@ -192,7 +261,7 @@ mod tests {
             })
             .collect();
         // Apply from last (highest offset) to first so earlier byte indices stay valid.
-        byte_ranges.sort_by(|a, b| b.0.cmp(&a.0));
+        byte_ranges.sort_by_key(|b| std::cmp::Reverse(b.0));
         let mut result = pre_text.to_string();
         for (start, end, new_text) in byte_ranges {
             result.replace_range(start..end, new_text);
@@ -222,14 +291,12 @@ mod tests {
         let pre_snap = buf.snapshot().clone();
         let pre_text = pre_snap.text();
 
-        let op = buf.edit([(6..6, "beautiful ")]);
-        let edit_op = op.as_edit().expect("edit must produce an EditOperation");
-        let post_text = buf.text();
+        buf.edit([(6..6, "beautiful ")]);
+        let post_snap = buf.snapshot().clone();
+        let post_text = post_snap.text();
 
-        // STUB: panics with unimplemented! → RED
-        let changes = encode_changes(&pre_snap, edit_op);
+        let changes = encode_changes_since(&post_snap, pre_snap.version());
 
-        // These assertions are the GREEN contract (never reached in RED state).
         assert_eq!(changes.len(), 1, "single-range insert → one WireChange");
         let reconstructed = apply_single(&pre_text, &changes[0]);
         assert_eq!(
@@ -251,12 +318,11 @@ mod tests {
         let pre_snap = buf.snapshot().clone();
         let pre_text = pre_snap.text();
 
-        let op = buf.edit([(6..11, "")]);
-        let edit_op = op.as_edit().expect("edit must produce an EditOperation");
-        let post_text = buf.text();
+        buf.edit([(6..11, "")]);
+        let post_snap = buf.snapshot().clone();
+        let post_text = post_snap.text();
 
-        // STUB: panics → RED
-        let changes = encode_changes(&pre_snap, edit_op);
+        let changes = encode_changes_since(&post_snap, pre_snap.version());
 
         assert_eq!(changes.len(), 1, "single-range delete → one WireChange");
         let reconstructed = apply_single(&pre_text, &changes[0]);
@@ -283,14 +349,13 @@ mod tests {
         let pre_text = pre_snap.text();
 
         // Replace the 2-byte 'é' (bytes 3..5) with ASCII 'e' (1 byte).
-        let op = buf.edit([(3..5, "e")]);
-        let edit_op = op.as_edit().expect("edit must produce an EditOperation");
-        let post_text = buf.text();
+        buf.edit([(3..5, "e")]);
+        let post_snap = buf.snapshot().clone();
+        let post_text = post_snap.text();
 
         assert_eq!(post_text, "cafe", "sanity: post-edit text must be 'cafe'");
 
-        // STUB: panics → RED
-        let changes = encode_changes(&pre_snap, edit_op);
+        let changes = encode_changes_since(&post_snap, pre_snap.version());
 
         assert_eq!(changes.len(), 1);
         let change = &changes[0];
@@ -326,14 +391,13 @@ mod tests {
         let pre_text = pre_snap.text();
 
         // Replace the 4-byte emoji (bytes 3..7) with "!".
-        let op = buf.edit([(3..7, "!")]);
-        let edit_op = op.as_edit().expect("edit must produce an EditOperation");
-        let post_text = buf.text();
+        buf.edit([(3..7, "!")]);
+        let post_snap = buf.snapshot().clone();
+        let post_text = post_snap.text();
 
         assert_eq!(post_text, "hi !", "sanity: post-edit text must be 'hi !'");
 
-        // STUB: panics → RED
-        let changes = encode_changes(&pre_snap, edit_op);
+        let changes = encode_changes_since(&post_snap, pre_snap.version());
 
         assert_eq!(changes.len(), 1);
         let change = &changes[0];
@@ -381,19 +445,20 @@ mod tests {
         let pre_text = pre_snap.text(); // " bar"
 
         // Second edit: insert "baz" at visible position 0 of " bar".
-        let op2 = buf.edit([(0..0, "baz")]);
-        let edit_op2 = op2.as_edit().expect("edit2 must produce an EditOperation");
-        let post_text = buf.text(); // "baz bar"
+        buf.edit([(0..0, "baz")]);
+        let post_snap = buf.snapshot().clone();
+        let post_text = post_snap.text(); // "baz bar"
 
         assert_eq!(
             post_text, "baz bar",
             "sanity: post-edit text must be 'baz bar'"
         );
 
-        // STUB: panics → RED (and that's exactly what we want)
-        let changes = encode_changes(&pre_snap, edit_op2);
+        // The delivery cursor is the pre-edit version (" bar"); the FullOffset of
+        // the insertion diverges from the visible offset, but edits_since does the
+        // version-aware diff so the wire range is correctly (0,0)..(0,0).
+        let changes = encode_changes_since(&post_snap, pre_snap.version());
 
-        // GREEN contract (never reached while RED):
         assert_eq!(changes.len(), 1, "single insertion → one WireChange");
         let change = &changes[0];
         assert_eq!(
@@ -409,6 +474,138 @@ mod tests {
         assert_eq!(
             reconstructed, post_text,
             "applying WireChange after prior deletion must reproduce post-edit text"
+        );
+    }
+
+    /// Multi-edit (daedalus test 2) — two separated ranges in one batch.
+    ///
+    /// pre:  "hello world foo"
+    /// edits: replace (0..5,"HI") and (12..15,"BAR") in one transaction
+    /// post: "HI world BAR"
+    ///
+    /// Ranges are in the client (pre-edit) frame. The wire order must be
+    /// DESCENDING by start so naive in-order application reconstructs exactly,
+    /// AND the frame-agnostic `apply_changes` helper (re-sorts) must also agree.
+    #[test]
+    fn test_encode_changes_multi_edit_descending_order() {
+        let mut buf = make_buffer("hello world foo");
+        let pre_snap = buf.snapshot().clone();
+        let pre_text = pre_snap.text();
+
+        buf.edit([(0..5, "HI"), (12..15, "BAR")]);
+        let post_snap = buf.snapshot().clone();
+        let post_text = post_snap.text();
+        assert_eq!(post_text, "HI world BAR", "sanity");
+
+        let changes = encode_changes_since(&post_snap, pre_snap.version());
+        assert_eq!(changes.len(), 2, "two separated ranges → two WireChanges");
+
+        // Wire order must be descending by start position.
+        let starts: Vec<(u32, u32)> = changes
+            .iter()
+            .map(|c| (c.range.start.line, c.range.start.character))
+            .collect();
+        assert!(
+            starts[0] > starts[1],
+            "changes must be ordered descending by start: {starts:?}"
+        );
+
+        // Naive in-order application against the held (pre-edit) text is exact.
+        let mut naive = pre_text.clone();
+        for change in &changes {
+            let start = point_utf16_to_offset(
+                &naive,
+                change.range.start.line,
+                change.range.start.character,
+            )
+            .unwrap();
+            let end =
+                point_utf16_to_offset(&naive, change.range.end.line, change.range.end.character)
+                    .unwrap();
+            naive.replace_range(start..end, &change.new_text);
+        }
+        assert_eq!(
+            naive, post_text,
+            "in-order (descending) application is exact"
+        );
+
+        // Frame-agnostic batch reconstruction also agrees.
+        assert_eq!(apply_changes(&pre_text, &changes), post_text);
+    }
+
+    /// Remote apply_ops (daedalus test 3) — didChange computed AFTER mutation.
+    ///
+    /// An edit made on replica A is shipped to replica B via `apply_ops`. The
+    /// post-mutation snapshot of B, diffed against B's pre-mutation version,
+    /// reconstructs B's new text exactly — proving the seam is correct for
+    /// remote/collab ops (the handler sets isLocal=false from the event source).
+    #[test]
+    fn test_encode_changes_remote_apply_ops_after_mutation() {
+        use text::Operation;
+
+        // Two replicas of the same buffer, same base text. A's edit (its op has
+        // an empty base version, trivially observed by B) ships to B unchanged.
+        let mut buf_a = make_buffer("shared text");
+        let mut buf_b = Buffer::new(ReplicaId::new(1), BufferId::new(1).unwrap(), "shared text");
+
+        // A deletes "shared " (bytes 0..7); B starts from the same text.
+        let op = buf_a.edit([(0..7, "")]);
+
+        let pre_snap_b = buf_b.snapshot().clone();
+        let pre_text_b = pre_snap_b.text();
+        buf_b.apply_ops([Operation::Edit(op.as_edit().unwrap().clone())]);
+        let post_snap_b = buf_b.snapshot().clone();
+        let post_text_b = post_snap_b.text();
+        assert_eq!(
+            post_text_b, "text",
+            "sanity: B reflects the remote deletion"
+        );
+
+        let changes = encode_changes_since(&post_snap_b, pre_snap_b.version());
+        assert_eq!(
+            apply_changes(&pre_text_b, &changes),
+            post_text_b,
+            "remote op reconstructs exactly when diffed after mutation"
+        );
+    }
+
+    /// Delivery cursor (daedalus test 4a) — successive edits V0→V1→V2 with the
+    /// cursor advancing each step produce no duplicated or skipped content.
+    #[test]
+    fn test_encode_changes_cursor_advances_no_dup_or_skip() {
+        let mut buf = make_buffer("one two three");
+
+        let v0 = buf.version();
+        let text_v0 = buf.text();
+
+        buf.edit([(0..3, "ONE")]); // "ONE two three"
+        let snap_v1 = buf.snapshot().clone();
+        let v1 = snap_v1.version().clone();
+        let text_v1 = snap_v1.text();
+
+        buf.edit([(8..11, "THR")]); // "ONE two THRee"
+        let snap_v2 = buf.snapshot().clone();
+        let text_v2 = snap_v2.text();
+
+        // First delivery: V0 → V1.
+        let changes_a = encode_changes_since(&snap_v1, &v0);
+        assert_eq!(
+            apply_changes(&text_v0, &changes_a),
+            text_v1,
+            "V0→V1 reconstructs V1"
+        );
+
+        // Cursor advanced to V1; second delivery diffs only V1 → V2.
+        let changes_b = encode_changes_since(&snap_v2, &v1);
+        assert_eq!(
+            apply_changes(&text_v1, &changes_b),
+            text_v2,
+            "V1→V2 reconstructs V2 with no re-send of the first edit"
+        );
+        // The second delivery must NOT include the first edit's region again.
+        assert!(
+            changes_b.iter().all(|c| c.new_text != "ONE"),
+            "advancing the cursor must not re-deliver the V0→V1 edit"
         );
     }
 
