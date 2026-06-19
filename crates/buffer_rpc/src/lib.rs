@@ -20,10 +20,11 @@
 //! `socket_path_from_env_or_settings` returns `None` in that case; the `app.run` call site
 //! in `main.rs` uses it as a gate.
 
-use std::{env, path::PathBuf};
+use std::{collections::HashMap, env, path::PathBuf};
 
 use futures::StreamExt;
-use gpui::{App, Global};
+use gpui::{App, Entity, Global};
+use language::Buffer;
 
 pub mod framing;
 pub mod handlers;
@@ -33,6 +34,14 @@ pub mod transport;
 
 pub struct BufferRpcServer {
     socket_path: PathBuf,
+    /// Strong handles to buffers opened via `buffer/open`.
+    ///
+    /// `BufferStore` only holds `WeakEntity<Buffer>` and relies on the opener to
+    /// retain a strong reference; an RPC-opened *invisible* buffer has no editor
+    /// keeping it alive, so the server must retain it here to keep it reachable
+    /// by `buffer/text` (and later `buffer/edit`/`buffer/save`).  Keyed by the
+    /// protocol buffer id (`BufferId::to_proto`).
+    opened_buffers: HashMap<u64, Entity<Buffer>>,
 }
 
 impl Global for BufferRpcServer {}
@@ -40,6 +49,16 @@ impl Global for BufferRpcServer {}
 impl BufferRpcServer {
     pub fn socket_path(&self) -> &PathBuf {
         &self.socket_path
+    }
+
+    /// Retain a strong handle to an RPC-opened buffer so it stays alive.
+    pub fn retain_buffer(&mut self, buffer_id: u64, buffer: Entity<Buffer>) {
+        self.opened_buffers.insert(buffer_id, buffer);
+    }
+
+    /// Look up a previously RPC-opened buffer by its protocol id.
+    pub fn buffer(&self, buffer_id: u64) -> Option<Entity<Buffer>> {
+        self.opened_buffers.get(&buffer_id).cloned()
     }
 }
 
@@ -55,13 +74,18 @@ pub fn init(path: PathBuf, cx: &mut App) {
         }
     };
 
-    cx.set_global(BufferRpcServer { socket_path: path });
+    cx.set_global(BufferRpcServer {
+        socket_path: path,
+        opened_buffers: HashMap::new(),
+    });
     cx.spawn(async move |cx| {
+        // Foreground drain task (constraint 1): entity access happens via
+        // `cx.update` inside `handlers::dispatch`; async buffer opens are awaited
+        // here in the spawned future.  No socket I/O or JSON framing on this
+        // thread — the transport's writer half owns all wire encoding.
         while let Some(request) = requests.next().await {
-            let _ = cx.update(|cx| {
-                let response = handlers::handle_request(request.request, cx);
-                request.responder.respond(response);
-            });
+            let response = handlers::dispatch(request.request, cx).await;
+            request.responder.respond(response);
         }
     })
     .detach();

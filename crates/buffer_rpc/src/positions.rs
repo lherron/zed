@@ -111,9 +111,62 @@ pub struct WireVersion(pub Vec<u32>);
 /// # UTF-16 rules
 /// Each BMP character counts as 1 unit; each astral character counts as 2.
 /// `character == utf16_line_len` is valid (past-end sentinel on that line).
-#[allow(unused_variables)]
-pub fn point_utf16_to_offset(text: &str, line: u32, character: u32) -> Result<usize, PositionError> {
-    unimplemented!("M1 impl: split text into lines, advance line bytes, then count UTF-16 code units up to `character`")
+pub fn point_utf16_to_offset(
+    text: &str,
+    line: u32,
+    character: u32,
+) -> Result<usize, PositionError> {
+    // Lines are delimited by '\n'; the final line may have no trailing newline.
+    // `split('\n')` always yields at least one segment, so `line_count >= 1`.
+    let line_count = text.split('\n').count() as u32;
+    if line >= line_count {
+        return Err(PositionError::LineOutOfRange { line, line_count });
+    }
+
+    // Byte offset of the first character of `line` (sum of each preceding
+    // segment's byte length plus its consumed '\n').
+    let line_start = text
+        .split('\n')
+        .take(line as usize)
+        .map(|segment| segment.len() + 1)
+        .sum::<usize>();
+
+    // The content of this line, excluding its trailing '\n' (if any).
+    let line_str = text[line_start..]
+        .split('\n')
+        .next()
+        .expect("split always yields at least one element");
+
+    let line_utf16_len: u32 = line_str.chars().map(|c| c.len_utf16() as u32).sum();
+    if character > line_utf16_len {
+        return Err(PositionError::CharacterOutOfRange {
+            line,
+            character,
+            line_len: line_utf16_len,
+        });
+    }
+
+    // Walk the line one Unicode scalar at a time, advancing the UTF-16
+    // code-unit counter (1 for BMP, 2 for astral) until we reach `character`.
+    let mut units: u32 = 0;
+    for (byte_idx, c) in line_str.char_indices() {
+        if units == character {
+            return Ok(line_start + byte_idx);
+        }
+        let next = units + c.len_utf16() as u32;
+        if next > character {
+            // `character` lands inside a surrogate pair — not a valid boundary.
+            return Err(PositionError::CharacterOutOfRange {
+                line,
+                character,
+                line_len: line_utf16_len,
+            });
+        }
+        units = next;
+    }
+
+    // `character == line_utf16_len`: past-end sentinel on this line.
+    Ok(line_start + line_str.len())
 }
 
 /// Convert a **byte offset** within `text` to a UTF-16 `(row, column)` pair.
@@ -129,9 +182,31 @@ pub fn point_utf16_to_offset(text: &str, line: u32, character: u32) -> Result<us
 /// # Returns
 /// `Ok((row, col))` where both are 0-indexed and `col` is a UTF-16 code-unit
 /// count from the start of `row`.
-#[allow(unused_variables)]
 pub fn offset_to_point_utf16(text: &str, offset: usize) -> Result<(u32, u32), PositionError> {
-    unimplemented!("M1 impl: walk text bytes up to `offset`, counting newlines (rows) and UTF-16 units (col)")
+    if offset > text.len() {
+        return Err(PositionError::OffsetOutOfRange {
+            offset,
+            len: text.len(),
+        });
+    }
+
+    // Walk scalars up to `offset`, tracking row (newlines seen) and the UTF-16
+    // column within the current row.  `offset` is assumed to fall on a char
+    // boundary (it comes from `point_utf16_to_offset` or a buffer snapshot).
+    let mut row: u32 = 0;
+    let mut col: u32 = 0;
+    for (byte_idx, c) in text.char_indices() {
+        if byte_idx >= offset {
+            break;
+        }
+        if c == '\n' {
+            row += 1;
+            col = 0;
+        } else {
+            col += c.len_utf16() as u32;
+        }
+    }
+    Ok((row, col))
 }
 
 // ── Version codec ─────────────────────────────────────────────────────────────
@@ -141,9 +216,12 @@ pub fn offset_to_point_utf16(text: &str, offset: usize) -> Result<(u32, u32), Po
 /// The resulting [`WireVersion`] is a dense `Vec<u32>` — index `i` is the
 /// highest sequence number seen for replica `i`.  Trailing zero entries are
 /// stripped so that an all-zero / empty version serialises as `[]`.
-#[allow(unused_variables)]
 pub fn encode_version(version: &Global) -> WireVersion {
-    unimplemented!("M1 impl: collect version.iter() values into Vec<u32>, strip trailing zeros")
+    let mut values: Vec<u32> = version.iter().map(|timestamp| timestamp.value).collect();
+    while values.last() == Some(&0) {
+        values.pop();
+    }
+    WireVersion(values)
 }
 
 /// Decode a [`WireVersion`] back to a [`clock::Global`].
@@ -151,9 +229,18 @@ pub fn encode_version(version: &Global) -> WireVersion {
 /// Index `i` in `wire.0` becomes a [`Lamport`] observation for replica `i`
 /// with the corresponding sequence number.  Missing trailing entries imply
 /// sequence 0 (not observed).
-#[allow(unused_variables)]
 pub fn decode_version(wire: WireVersion) -> Global {
-    unimplemented!("M1 impl: for each (i, seq) in wire.0, observe Lamport {{ replica_id: i, value: seq }} into a fresh Global")
+    use clock::{Lamport, ReplicaId};
+
+    let mut version = Global::new();
+    for (replica_id, seq) in wire.0.into_iter().enumerate() {
+        // `observe` is a no-op for seq 0, so trailing/implicit zeros are fine.
+        version.observe(Lamport {
+            replica_id: ReplicaId::new(replica_id as u16),
+            value: seq,
+        });
+    }
+    version
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -165,7 +252,11 @@ mod tests {
 
     // Helper: build a Position with no byte offset.
     fn pos(line: u32, character: u32) -> Position {
-        Position { line, character, offset: None }
+        Position {
+            line,
+            character,
+            offset: None,
+        }
     }
 
     // ── UTF-16 → byte offset ──────────────────────────────────────────────────
@@ -178,20 +269,20 @@ mod tests {
     #[test]
     fn test_ascii_point_to_offset() {
         let text = "hello\nworld";
-        assert_eq!(point_utf16_to_offset(text, 0, 0), Ok(0));   // 'h'
-        assert_eq!(point_utf16_to_offset(text, 0, 5), Ok(5));   // '\n' (past-end col on line 0)
-        assert_eq!(point_utf16_to_offset(text, 1, 0), Ok(6));   // 'w'
-        assert_eq!(point_utf16_to_offset(text, 1, 5), Ok(11));  // past end of "world"
+        assert_eq!(point_utf16_to_offset(text, 0, 0), Ok(0)); // 'h'
+        assert_eq!(point_utf16_to_offset(text, 0, 5), Ok(5)); // '\n' (past-end col on line 0)
+        assert_eq!(point_utf16_to_offset(text, 1, 0), Ok(6)); // 'w'
+        assert_eq!(point_utf16_to_offset(text, 1, 5), Ok(11)); // past end of "world"
     }
 
     /// Pure ASCII: byte offset → UTF-16 `(row, col)`.
     #[test]
     fn test_ascii_offset_to_point() {
         let text = "hello\nworld";
-        assert_eq!(offset_to_point_utf16(text, 0), Ok((0, 0)));  // 'h'
-        assert_eq!(offset_to_point_utf16(text, 4), Ok((0, 4)));  // 'o'
-        assert_eq!(offset_to_point_utf16(text, 5), Ok((0, 5)));  // '\n'
-        assert_eq!(offset_to_point_utf16(text, 6), Ok((1, 0)));  // 'w'
+        assert_eq!(offset_to_point_utf16(text, 0), Ok((0, 0))); // 'h'
+        assert_eq!(offset_to_point_utf16(text, 4), Ok((0, 4))); // 'o'
+        assert_eq!(offset_to_point_utf16(text, 5), Ok((0, 5))); // '\n'
+        assert_eq!(offset_to_point_utf16(text, 6), Ok((1, 0))); // 'w'
         assert_eq!(offset_to_point_utf16(text, 11), Ok((1, 5))); // past-end sentinel
     }
 
@@ -303,7 +394,10 @@ mod tests {
         let text = "hello\nworld";
         assert_eq!(
             point_utf16_to_offset(text, 2, 0),
-            Err(PositionError::LineOutOfRange { line: 2, line_count: 2 })
+            Err(PositionError::LineOutOfRange {
+                line: 2,
+                line_count: 2
+            })
         );
     }
 
@@ -316,7 +410,11 @@ mod tests {
         let text = "hello";
         assert_eq!(
             point_utf16_to_offset(text, 0, 6),
-            Err(PositionError::CharacterOutOfRange { line: 0, character: 6, line_len: 5 })
+            Err(PositionError::CharacterOutOfRange {
+                line: 0,
+                character: 6,
+                line_len: 5
+            })
         );
     }
 
@@ -356,7 +454,11 @@ mod tests {
     /// and the `"offset"` field IS present in the JSON.
     #[test]
     fn test_position_serde_with_offset() {
-        let p = Position { line: 5, character: 10, offset: Some(1234) };
+        let p = Position {
+            line: 5,
+            character: 10,
+            offset: Some(1234),
+        };
         let json = serde_json::to_string(&p).unwrap();
         assert!(
             json.contains("\"offset\":1234"),
@@ -369,7 +471,10 @@ mod tests {
     /// A [`Range`] round-trips through serde correctly.
     #[test]
     fn test_range_serde_roundtrip() {
-        let r = Range { start: pos(0, 5), end: pos(2, 3) };
+        let r = Range {
+            start: pos(0, 5),
+            end: pos(2, 3),
+        };
         let json = serde_json::to_string(&r).unwrap();
         let decoded: Range = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, r);
@@ -390,8 +495,14 @@ mod tests {
     #[test]
     fn test_version_roundtrip() {
         let mut v = Global::new();
-        v.observe(Lamport { replica_id: ReplicaId::LOCAL, value: 5 });
-        v.observe(Lamport { replica_id: ReplicaId::REMOTE_SERVER, value: 3 });
+        v.observe(Lamport {
+            replica_id: ReplicaId::LOCAL,
+            value: 5,
+        });
+        v.observe(Lamport {
+            replica_id: ReplicaId::REMOTE_SERVER,
+            value: 3,
+        });
         let wire = encode_version(&v);
         let decoded = decode_version(wire);
         assert_eq!(decoded, v);
@@ -403,10 +514,18 @@ mod tests {
     fn test_version_wire_trailing_zeros_stripped() {
         let mut v = Global::new();
         // Observe only replica 0; replica 1 is implicitly 0.
-        v.observe(Lamport { replica_id: ReplicaId::LOCAL, value: 7 });
+        v.observe(Lamport {
+            replica_id: ReplicaId::LOCAL,
+            value: 7,
+        });
         let wire = encode_version(&v);
         // Wire vec should be [7], not [7, 0].
-        assert_eq!(wire.0.len(), 1, "trailing zeros must be stripped; got: {:?}", wire.0);
+        assert_eq!(
+            wire.0.len(),
+            1,
+            "trailing zeros must be stripped; got: {:?}",
+            wire.0
+        );
         // Round-trip must still be equal.
         let decoded = decode_version(wire);
         assert_eq!(decoded, v);
