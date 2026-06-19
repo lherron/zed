@@ -1,0 +1,19 @@
+#!/bin/sh
+# Guard: this is a purely local fork (lherron/zed). NEVER push to the
+# zed-industries upstream. Blocks pushes whose target URL or remote name points
+# at upstream, regardless of how the push was invoked (remote name or explicit
+# URL). Install with scripts/install-local-fork-hooks.sh.
+
+remote_name="$1"
+remote_url="$2"
+
+case "$remote_url$remote_name" in
+  *zed-industries*|*DISABLED_NO_UPSTREAM_PUSH*|*upstream*)
+    echo "pre-push: BLOCKED — refusing to push to upstream (zed-industries)." >&2
+    echo "pre-push: remote='$remote_name' url='$remote_url'" >&2
+    echo "pre-push: this fork is local-only and must never be pushed upstream." >&2
+    exit 1
+    ;;
+esac
+
+exit 0
