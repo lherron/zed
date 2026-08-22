@@ -525,6 +525,9 @@ fn main() {
         git_hosting_providers::init(cx);
 
         OpenListener::set_global(cx, open_listener.clone());
+        // Buffer RPC server is always-on; it resolves a fixed default socket
+        // path under ~/praesidium/var/run when ZED_BUFFER_RPC_SOCK is unset.
+        buffer_rpc::init(buffer_rpc::socket_path_from_env_or_settings(cx), cx);
 
         extension::init(cx);
         let extension_host_proxy = ExtensionHostProxy::global(cx);

@@ -77,6 +77,7 @@ audio.workspace = true
 auto_update.workspace = true
 auto_update_ui.workspace = true
 breadcrumbs.workspace = true
+buffer_rpc.workspace = true
 call.workspace = true
 chrono.workspace = true
 channel.workspace = true
@@ -275,9 +276,9 @@ repl = { workspace = true, features = ["test-support"] }
 
 
 [package.metadata.bundle-dev]
-icon = ["resources/app-icon-dev@2x.png", "resources/app-icon-dev.png"]
-identifier = "dev.zed.Zed-Dev"
-name = "Zed Dev"
+icon = ["resources/app-icon-rpc@2x.png", "resources/app-icon-rpc.png"]
+identifier = "dev.lherron.zed-rpc"
+name = "Zed RPC"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
 osx_url_schemes = ["zed"]
